@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import type Database from 'better-sqlite3';
 import { AppConfig } from '../config.ts';
+import { MAX_EMPLOYEE_ACCOUNTS } from '../db/database.ts';
 import { createRateLimiter, requireAuth } from '../middleware/security.ts';
 import {
   generateId,
@@ -12,7 +13,7 @@ import {
   verifyPassword,
 } from '../security/crypto.ts';
 import { recordAuditLog } from '../services/auditService.ts';
-import { dispatchTransactionSms } from '../providers/smsProvider.ts';
+import { dispatchTransactionNotifications } from '../providers/emailProvider.ts';
 
 export function createAuthRouter(db: Database.Database, config: AppConfig): Router {
   const router = Router();
@@ -292,7 +293,7 @@ export function createAuthRouter(db: Database.Database, config: AppConfig): Rout
     res.json({ ok: true, message: 'Password updated successfully.' });
   });
 
-  router.post('/recover/request', recoverLimiter, (req, res) => {
+  router.post('/recover/request', recoverLimiter, async (req, res) => {
     const { usernameOrEmail } = (req.body || {}) as { usernameOrEmail?: string };
     if (!usernameOrEmail || typeof usernameOrEmail !== 'string') {
       res.status(400).json({ error: 'VALIDATION_ERROR', message: 'Username or email is required.' });
@@ -301,9 +302,18 @@ export function createAuthRouter(db: Database.Database, config: AppConfig): Rout
 
     const lookup = usernameOrEmail.trim().toLowerCase();
     const user = db
-      .prepare('SELECT id, username, mobile, role, status, sms_opt_in FROM users WHERE lower(username) = ? OR lower(email) = ?')
+      .prepare('SELECT id, username, mobile, email, role, status, sms_opt_in, email_opt_in FROM users WHERE lower(username) = ? OR lower(email) = ?')
       .get(lookup, lookup) as
-      | { id: string; username: string; mobile: string | null; role: string; status: string; sms_opt_in: number }
+      | {
+          id: string;
+          username: string;
+          mobile: string | null;
+          email: string | null;
+          role: string;
+          status: string;
+          sms_opt_in: number;
+          email_opt_in: number;
+        }
       | undefined;
 
     let sandboxPreview: { recoveryToken?: string; maskedMobile?: string } | undefined;
@@ -317,10 +327,13 @@ export function createAuthRouter(db: Database.Database, config: AppConfig): Rout
          VALUES (?, ?, ?, ?, ?)`,
       ).run(generateId('rec'), user.id, sha256(rawToken), expiresAt, now.toISOString());
 
-      dispatchTransactionSms(db, config, {
+      await dispatchTransactionNotifications(db, config, {
         userId: user.id,
         mobile: user.mobile,
+        email: user.email,
         smsOptIn: true,
+        emailOptIn: true,
+        subject: 'Meridian Trust Bank — Password Recovery Requested',
         message: `Meridian Trust Bank recovery code requested for ${user.username}. Valid for 15 minutes.`,
       });
 
@@ -471,30 +484,47 @@ export function createAuthRouter(db: Database.Database, config: AppConfig): Rout
     const now = new Date().toISOString();
     const userId = generateId('usr');
 
-    db.transaction(() => {
-      db.prepare(`
-        INSERT INTO users (
-          id, username, email, mobile, full_name, password_hash, role, status,
-          must_change_password, sms_opt_in, email_opt_in, kyc_status, department, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'employee', 'active', 0, 1, 1, 'verified', ?, ?, ?)
-      `).run(
-        userId,
-        cleanUsername,
-        invite.email.toLowerCase(),
-        invite.mobile,
-        invite.full_name,
-        hashPassword(password),
-        invite.department,
-        now,
-        now,
-      );
+    try {
+      db.transaction(() => {
+        const empCount = (db.prepare(`SELECT COUNT(*) AS cnt FROM users WHERE role = 'employee'`).get() as { cnt: number }).cnt;
+        if (empCount >= MAX_EMPLOYEE_ACCOUNTS) {
+          const err = new Error(
+            `Maximum capacity of ${MAX_EMPLOYEE_ACCOUNTS} employee IDs reached. Delete an existing employee first.`,
+          ) as Error & { code?: string };
+          err.code = 'EMPLOYEE_LIMIT_REACHED';
+          throw err;
+        }
 
-      db.prepare(`
-        UPDATE employee_invites
-        SET email_verified = 1, mobile_verified = 1, status = 'accepted', accepted_user_id = ?, updated_at = ?
-        WHERE id = ?
-      `).run(userId, now, invite.id);
-    })();
+        db.prepare(`
+          INSERT INTO users (
+            id, username, email, mobile, full_name, password_hash, role, status,
+            must_change_password, sms_opt_in, email_opt_in, kyc_status, department, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, 'employee', 'active', 0, 1, 1, 'verified', ?, ?, ?)
+        `).run(
+          userId,
+          cleanUsername,
+          invite.email.toLowerCase(),
+          invite.mobile,
+          invite.full_name,
+          hashPassword(password),
+          invite.department,
+          now,
+          now,
+        );
+
+        db.prepare(`
+          UPDATE employee_invites
+          SET email_verified = 1, mobile_verified = 1, status = 'accepted', accepted_user_id = ?, updated_at = ?
+          WHERE id = ?
+        `).run(userId, now, invite.id);
+      }).immediate();
+    } catch (err) {
+      if ((err as { code?: string }).code === 'EMPLOYEE_LIMIT_REACHED') {
+        res.status(409).json({ error: 'EMPLOYEE_LIMIT_REACHED', message: (err as Error).message });
+        return;
+      }
+      throw err;
+    }
 
     recordAuditLog(db, {
       actorUserId: userId,

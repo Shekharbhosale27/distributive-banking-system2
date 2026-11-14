@@ -7,14 +7,21 @@ import {
   FileCheck2,
   KeyRound,
   LogOut,
+  Mail,
   RotateCcw,
+  Search,
+  Send,
   Shield,
+  Trash2,
   Users,
 } from 'lucide-react';
+import type { User as FirebaseUser } from 'firebase/auth';
 import { ApiError, apiFetch, formatDateTime, formatInr, type AuthUser } from '../lib/api';
+import { getGoogleAccessToken, googleSignIn, googleSignOut, initGoogleAuth } from '../lib/googleAuth';
+import { GoogleSignInButton } from './GoogleSignInButton';
 import { EmptyState, TableSkeleton, TxStatusText } from './StatusIndicator';
 
-type ManagerTab = 'overview' | 'credentials' | 'employees' | 'ledger' | 'customers' | 'audit' | 'integrations';
+type ManagerTab = 'overview' | 'credentials' | 'employees' | 'messages' | 'ledger' | 'customers' | 'audit' | 'integrations';
 
 interface OverviewData {
   aggregates: {
@@ -49,6 +56,7 @@ interface OverviewData {
     name: string;
     mode: string;
     configured: boolean;
+    adapter?: string;
     requirements: string;
   }>;
 }
@@ -128,6 +136,22 @@ interface CredentialRecord {
   updatedAt: string;
 }
 
+interface SentMessageRecord {
+  id: string;
+  user_id: string;
+  username: string;
+  full_name: string;
+  role: 'user' | 'employee';
+  channel: 'sms' | 'email' | 'in_app';
+  recipient_masked: string;
+  message: string;
+  provider: string;
+  provider_message_id: string | null;
+  status: string;
+  error_message: string | null;
+  created_at: string;
+}
+
 export function ManagerWorkspace({ user, onLogout }: { user: AuthUser; onLogout: () => Promise<void> }) {
   const [tab, setTab] = useState<ManagerTab>('overview');
   const [loading, setLoading] = useState(true);
@@ -138,6 +162,7 @@ export function ManagerWorkspace({ user, onLogout }: { user: AuthUser; onLogout:
   const [customers, setCustomers] = useState<CustomerSummary[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLogRow[]>([]);
   const [credentials, setCredentials] = useState<CredentialRecord[]>([]);
+  const [accountLimits, setAccountLimits] = useState({ maxUsers: 20, maxEmployees: 5 });
 
   // Credential provisioning & reset form state
   const [credRole, setCredRole] = useState<'user' | 'employee'>('user');
@@ -150,6 +175,9 @@ export function ManagerWorkspace({ user, onLogout }: { user: AuthUser; onLogout:
   const [credError, setCredError] = useState<string | null>(null);
   const [resetPasswords, setResetPasswords] = useState<Record<string, string>>({});
   const [credFilter, setCredFilter] = useState<'all' | 'user' | 'employee'>('all');
+  const [credSearch, setCredSearch] = useState('');
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   // Employee Invite Form
   const [invName, setInvName] = useState('');
@@ -163,21 +191,61 @@ export function ManagerWorkspace({ user, onLogout }: { user: AuthUser; onLogout:
     mobileCode: string;
   } | null>(null);
 
-  // Access / Reversal action state
+  // Access / Reversal & Integration Diagnostic state
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionSuccess, setActionSuccess] = useState<string | null>(null);
   const [reasonInputs, setReasonInputs] = useState<Record<string, string>>({});
+  const [diagChannel, setDiagChannel] = useState<'sms' | 'email'>('email');
+  const [diagRecipient, setDiagRecipient] = useState('');
+  const [diagMessage, setDiagMessage] = useState('Meridian Trust Bank diagnostic alert: Real-time delivery verification.');
+  const [diagBusy, setDiagBusy] = useState(false);
+  const [diagConfirmGmailOpen, setDiagConfirmGmailOpen] = useState(false);
+  const [mgrGoogleUser, setMgrGoogleUser] = useState<FirebaseUser | null>(null);
+  const [mgrGoogleToken, setMgrGoogleToken] = useState<string | null>(() => getGoogleAccessToken());
+
+  // Direct Manager Messaging (SMS + Email/Gmail + In-App)
+  const [sentMessages, setSentMessages] = useState<SentMessageRecord[]>([]);
+  const [msgAudience, setMsgAudience] = useState<'selected' | 'all_users' | 'all_employees' | 'all'>('selected');
+  const [msgSelectedIds, setMsgSelectedIds] = useState<string[]>([]);
+  const [msgRecipientSearch, setMsgRecipientSearch] = useState('');
+  const [msgChannels, setMsgChannels] = useState<{ sms: boolean; email: boolean; inApp: boolean }>({
+    sms: true,
+    email: true,
+    inApp: true,
+  });
+  const [msgSubject, setMsgSubject] = useState('');
+  const [msgBody, setMsgBody] = useState('');
+  const [msgBusy, setMsgBusy] = useState(false);
+  const [msgConfirmGmailOpen, setMsgConfirmGmailOpen] = useState(false);
+
+  useEffect(() => {
+    const unsub = initGoogleAuth(
+      (gUser, token) => {
+        setMgrGoogleUser(gUser);
+        setMgrGoogleToken(token);
+      },
+      () => {
+        setMgrGoogleUser(null);
+        setMgrGoogleToken(null);
+      },
+    );
+    return () => unsub();
+  }, []);
 
   const loadAll = useCallback(async () => {
     setLoading(true);
     try {
-      const [ov, emp, tx, cust, aud, cred] = await Promise.all([
+      const [ov, emp, tx, cust, aud, cred, msgs] = await Promise.all([
         apiFetch<OverviewData>('/api/manager/overview'),
         apiFetch<{ employees: EmployeeRecord[]; invites: InviteRecord[] }>('/api/manager/employees'),
         apiFetch<{ transactions: ManagerTxRow[] }>('/api/manager/transactions'),
         apiFetch<{ customers: CustomerSummary[] }>('/api/manager/customers'),
         apiFetch<{ logs: AuditLogRow[] }>('/api/manager/audit-logs'),
-        apiFetch<{ credentials: CredentialRecord[] }>('/api/manager/credentials'),
+        apiFetch<{
+          credentials: CredentialRecord[];
+          limits?: { maxUsers: number; maxEmployees: number };
+        }>('/api/manager/credentials'),
+        apiFetch<{ messages: SentMessageRecord[] }>('/api/manager/messages'),
       ]);
       setOverview(ov);
       setEmployees(emp.employees);
@@ -186,6 +254,10 @@ export function ManagerWorkspace({ user, onLogout }: { user: AuthUser; onLogout:
       setCustomers(cust.customers);
       setAuditLogs(aud.logs);
       setCredentials(cred.credentials);
+      setSentMessages(msgs.messages);
+      if (cred.limits) {
+        setAccountLimits({ maxUsers: cred.limits.maxUsers, maxEmployees: cred.limits.maxEmployees });
+      }
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         await onLogout();
@@ -341,10 +413,183 @@ export function ManagerWorkspace({ user, onLogout }: { user: AuthUser; onLogout:
     }
   }
 
+  async function handleManagerGoogleSignIn() {
+    setActionError(null);
+    try {
+      const res = await googleSignIn();
+      setMgrGoogleUser(res.user);
+      setMgrGoogleToken(res.accessToken);
+      setActionSuccess(`Connected Google account (${res.user.email || 'Gmail'}) for Gmail API testing.`);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Google Sign-In failed.');
+    }
+  }
+
+  async function runTestNotification(useConnectedGmail: boolean) {
+    setActionError(null);
+    setActionSuccess(null);
+    setDiagBusy(true);
+    try {
+      const token = useConnectedGmail ? getGoogleAccessToken() || mgrGoogleToken : null;
+      const res = await apiFetch<{
+        ok: boolean;
+        result: { status: string; provider: string; providerMessageId?: string | null };
+      }>('/api/manager/integrations/test-notification', {
+        method: 'POST',
+        headers: token ? { 'X-Gmail-Access-Token': token } : undefined,
+        body: JSON.stringify({
+          channel: diagChannel,
+          recipient: diagRecipient,
+          message: diagMessage,
+          confirmed: Boolean(token),
+        }),
+      });
+      setActionSuccess(
+        `Notification ${res.result.status} via ${res.result.provider}${
+          res.result.providerMessageId ? ` (Ref: ${res.result.providerMessageId})` : ''
+        }.`,
+      );
+      setDiagConfirmGmailOpen(false);
+    } catch (err) {
+      setDiagConfirmGmailOpen(false);
+      setActionError(err instanceof ApiError ? err.message : 'Notification dispatch test failed.');
+    } finally {
+      setDiagBusy(false);
+    }
+  }
+
+  function handlePreSubmitTestNotification(e: FormEvent) {
+    e.preventDefault();
+    if (diagChannel === 'email' && mgrGoogleToken) {
+      setDiagConfirmGmailOpen(true);
+      return;
+    }
+    void runTestNotification(false);
+  }
+
+  async function handleDeleteAccount(id: string, username: string) {
+    setActionError(null);
+    setActionSuccess(null);
+    setDeletingId(id);
+    const reason = reasonInputs[id]?.trim() || `Manager removed account ${username}`;
+    try {
+      const res = await apiFetch<{ message: string; deleted: { settledBalancePaise: number } }>(
+        `/api/manager/credentials/${id}`,
+        {
+          method: 'DELETE',
+          body: JSON.stringify({ reason }),
+        },
+      );
+      const settledSuffix =
+        res.deleted.settledBalancePaise > 0
+          ? ` Settled ${formatInr(res.deleted.settledBalancePaise)} back to vault.`
+          : '';
+      setActionSuccess(`${res.message}${settledSuffix}`);
+      setConfirmDeleteId(null);
+      await loadAll();
+    } catch (err) {
+      setActionError(err instanceof ApiError ? err.message : 'Unable to delete account.');
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
+  function jumpToMessageRecipient(userId: string) {
+    setActionError(null);
+    setActionSuccess(null);
+    setMsgAudience('selected');
+    setMsgSelectedIds([userId]);
+    setTab('messages');
+  }
+
+  function toggleRecipientId(userId: string) {
+    setMsgSelectedIds((prev) => (prev.includes(userId) ? prev.filter((id) => id !== userId) : [...prev, userId]));
+  }
+
+  async function executeSendManagerMessage(useConnectedGmail: boolean) {
+    setActionError(null);
+    setActionSuccess(null);
+    setMsgBusy(true);
+    try {
+      const channels: Array<'sms' | 'email' | 'in_app'> = [];
+      if (msgChannels.sms) channels.push('sms');
+      if (msgChannels.email) channels.push('email');
+      if (msgChannels.inApp) channels.push('in_app');
+
+      const token = useConnectedGmail ? getGoogleAccessToken() || mgrGoogleToken : null;
+      const res = await apiFetch<{
+        ok: boolean;
+        summary: {
+          totalRecipients: number;
+          smsSent: number;
+          emailSent: number;
+          inAppSent: number;
+          failedCount: number;
+        };
+      }>('/api/manager/messages/send', {
+        method: 'POST',
+        headers: token ? { 'X-Gmail-Access-Token': token } : undefined,
+        body: JSON.stringify({
+          audience: msgAudience,
+          recipientUserIds: msgAudience === 'selected' ? msgSelectedIds : [],
+          channels,
+          subject: msgSubject,
+          message: msgBody,
+          confirmed: Boolean(token),
+        }),
+      });
+
+      const parts = [
+        res.summary.smsSent > 0 ? `${res.summary.smsSent} SMS` : null,
+        res.summary.emailSent > 0 ? `${res.summary.emailSent} Email` : null,
+        res.summary.inAppSent > 0 ? `${res.summary.inAppSent} In-App` : null,
+      ].filter(Boolean);
+      setActionSuccess(
+        `Dispatched to ${res.summary.totalRecipients} recipient(s): ${parts.join(', ')}${
+          res.summary.failedCount > 0 ? ` (${res.summary.failedCount} failed)` : ''
+        }.`,
+      );
+      setMsgBody('');
+      setMsgSubject('');
+      setMsgConfirmGmailOpen(false);
+      await loadAll();
+    } catch (err) {
+      setMsgConfirmGmailOpen(false);
+      setActionError(err instanceof ApiError ? err.message : 'Unable to send message or email.');
+    } finally {
+      setMsgBusy(false);
+    }
+  }
+
+  function handlePreSubmitManagerMessage(e: FormEvent) {
+    e.preventDefault();
+    setActionError(null);
+    setActionSuccess(null);
+
+    if (!msgChannels.sms && !msgChannels.email && !msgChannels.inApp) {
+      setActionError('Select at least one channel (SMS, Email / Gmail, or In-App Alert).');
+      return;
+    }
+    if (msgAudience === 'selected' && msgSelectedIds.length === 0) {
+      setActionError('Select at least one active user or employee recipient.');
+      return;
+    }
+    if (msgBody.trim().length < 3) {
+      setActionError('Enter a message of at least 3 characters.');
+      return;
+    }
+    if (msgChannels.email && mgrGoogleToken) {
+      setMsgConfirmGmailOpen(true);
+      return;
+    }
+    void executeSendManagerMessage(false);
+  }
+
   const navItems: Array<{ id: ManagerTab; label: string; icon: typeof Building2 }> = [
     { id: 'overview', label: 'Bank Overview', icon: Building2 },
     { id: 'credentials', label: 'User & Employee Logins', icon: KeyRound },
     { id: 'employees', label: 'Employees & Invites', icon: Users },
+    { id: 'messages', label: 'Messages & Email', icon: Mail },
     { id: 'ledger', label: 'Ledger & Reversals', icon: RotateCcw },
     { id: 'customers', label: 'Customer Summary', icon: FileCheck2 },
     { id: 'audit', label: 'Audit Trail', icon: Shield },
@@ -523,10 +768,16 @@ export function ManagerWorkspace({ user, onLogout }: { user: AuthUser; onLogout:
                   <form onSubmit={handleInviteEmployee} className="lg:col-span-5 bg-white border border-slate-200 rounded-xl p-6 space-y-4">
                     <div>
                       <h2 className="text-base font-bold text-slate-900">Invite Employee</h2>
-                      <p className="text-xs text-slate-500 mt-0.5">
-                        Requires a Gmail address and mobile number. Employee must verify both before access is enabled.
+                      <p className="text-xs text-slate-500 mt-0.5 tabular-nums">
+                        {employees.length} / {accountLimits.maxEmployees} employee slots used · Requires Gmail and mobile verification.
                       </p>
                     </div>
+
+                    {employees.length >= accountLimits.maxEmployees && (
+                      <div role="alert" className="p-3 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-900">
+                        Maximum limit of {accountLimits.maxEmployees} employees reached. Delete an existing employee first.
+                      </div>
+                    )}
 
                     {invError && (
                       <div role="alert" className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-800">
@@ -588,7 +839,8 @@ export function ManagerWorkspace({ user, onLogout }: { user: AuthUser; onLogout:
                     </div>
                     <button
                       type="submit"
-                      className="w-full py-2.5 px-4 text-xs font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800"
+                      disabled={employees.length >= accountLimits.maxEmployees}
+                      className="w-full py-2.5 px-4 text-xs font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       Send Employee Invitation
                     </button>
@@ -616,25 +868,61 @@ export function ManagerWorkspace({ user, onLogout }: { user: AuthUser; onLogout:
                                 {emp.status}
                               </span>
                             </div>
-                            <div className="flex gap-2">
+                            <div className="flex flex-wrap gap-2">
                               <input
                                 type="text"
                                 value={reasonInputs[emp.id] || ''}
                                 onChange={(e) => setReasonInputs((prev) => ({ ...prev, [emp.id]: e.target.value }))}
-                                placeholder="Audit reason for status change..."
-                                className="flex-1 px-3 py-1.5 text-xs border border-slate-300 rounded-lg"
+                                placeholder="Audit reason for status or delete action..."
+                                className="flex-1 min-w-44 px-3 py-1.5 text-xs border border-slate-300 rounded-lg"
                               />
                               <button
                                 type="button"
+                                onClick={() => jumpToMessageRecipient(emp.id)}
+                                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 border border-slate-300 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0"
+                              >
+                                <Mail className="w-3.5 h-3.5" />
+                                Message
+                              </button>
+                              <button
+                                type="button"
                                 onClick={() => void handleToggleEmployeeStatus(emp)}
-                                className={`px-3 py-1.5 text-xs font-medium rounded-lg whitespace-nowrap ${
+                                className={`px-3 py-1.5 text-xs font-medium rounded-lg whitespace-nowrap shrink-0 ${
                                   emp.status === 'active'
-                                    ? 'text-red-700 border border-red-300 hover:bg-red-50'
+                                    ? 'text-amber-800 border border-amber-300 hover:bg-amber-50'
                                     : 'text-emerald-700 border border-emerald-300 hover:bg-emerald-50'
                                 }`}
                               >
                                 {emp.status === 'active' ? 'Deactivate' : 'Reactivate'}
                               </button>
+                              {confirmDeleteId === emp.id ? (
+                                <>
+                                  <button
+                                    type="button"
+                                    disabled={deletingId === emp.id}
+                                    onClick={() => void handleDeleteAccount(emp.id, emp.username)}
+                                    className="px-3 py-1.5 text-xs font-semibold text-white bg-red-700 rounded-lg hover:bg-red-800 disabled:opacity-60 whitespace-nowrap shrink-0"
+                                  >
+                                    {deletingId === emp.id ? 'Deleting...' : 'Confirm Delete'}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setConfirmDeleteId(null)}
+                                    className="px-3 py-1.5 text-xs font-medium text-slate-700 border border-slate-300 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0"
+                                  >
+                                    Cancel
+                                  </button>
+                                </>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() => setConfirmDeleteId(emp.id)}
+                                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-red-700 border border-red-300 rounded-lg hover:bg-red-50 whitespace-nowrap shrink-0"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                  Delete
+                                </button>
+                              )}
                             </div>
                           </div>
                         ))}
@@ -666,6 +954,276 @@ export function ManagerWorkspace({ user, onLogout }: { user: AuthUser; onLogout:
                   </div>
                 </div>
               )}
+
+              {tab === 'messages' && (() => {
+                const activeAccounts = credentials.filter((c) => c.status === 'active');
+                const activeUsers = activeAccounts.filter((c) => c.role === 'user');
+                const activeEmployees = activeAccounts.filter((c) => c.role === 'employee');
+                const filteredRecipients = activeAccounts.filter((c) => {
+                  const q = msgRecipientSearch.trim().toLowerCase();
+                  if (!q) return true;
+                  return (
+                    c.fullName.toLowerCase().includes(q) ||
+                    c.username.toLowerCase().includes(q) ||
+                    (c.email?.toLowerCase().includes(q) ?? false) ||
+                    c.role.toLowerCase().includes(q)
+                  );
+                });
+
+                const targetRecipientCount =
+                  msgAudience === 'all'
+                    ? activeAccounts.length
+                    : msgAudience === 'all_users'
+                      ? activeUsers.length
+                      : msgAudience === 'all_employees'
+                        ? activeEmployees.length
+                        : msgSelectedIds.length;
+
+                return (
+                  <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+                    <form
+                      onSubmit={handlePreSubmitManagerMessage}
+                      className="lg:col-span-5 bg-white border border-slate-200 rounded-xl p-6 space-y-4"
+                    >
+                      <div>
+                        <h2 className="text-base font-bold text-slate-900">Send Message &amp; Email</h2>
+                        <p className="text-xs text-slate-500 mt-0.5">
+                          Dispatch SMS, Gmail/Email notices, and in-app alerts directly to users or employees.
+                        </p>
+                      </div>
+
+                      <div className="p-3 rounded-lg bg-slate-50 border border-slate-200 space-y-2">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="text-xs font-medium text-slate-700">1P Gmail Sender</span>
+                          {mgrGoogleToken ? (
+                            <div className="flex items-center gap-2 text-xs">
+                              <span className="font-mono text-emerald-700 truncate max-w-40">
+                                {mgrGoogleUser?.email || 'Connected'}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => void googleSignOut().then(() => setMgrGoogleToken(null))}
+                                className="px-2 py-1 border border-slate-300 rounded text-slate-700 bg-white hover:bg-slate-100"
+                              >
+                                Disconnect
+                              </button>
+                            </div>
+                          ) : (
+                            <GoogleSignInButton
+                              onClick={() => void handleManagerGoogleSignIn()}
+                              label="Connect Gmail"
+                            />
+                          )}
+                        </div>
+                        <p className="text-xs text-slate-500">
+                          {mgrGoogleToken
+                            ? 'Emails will send directly from your connected Gmail account after confirmation.'
+                            : 'Optional: connect Gmail to send directly via Gmail API, or use the server SMS/Email gateway.'}
+                        </p>
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700 mb-1.5">Audience</label>
+                        <select
+                          value={msgAudience}
+                          onChange={(e) =>
+                            setMsgAudience(e.target.value as 'selected' | 'all_users' | 'all_employees' | 'all')
+                          }
+                          className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white"
+                        >
+                          <option value="selected">
+                            Selected User(s) / Employee(s) ({msgSelectedIds.length} selected)
+                          </option>
+                          <option value="all_users">All Active Users ({activeUsers.length})</option>
+                          <option value="all_employees">All Active Employees ({activeEmployees.length})</option>
+                          <option value="all">All Active Users &amp; Employees ({activeAccounts.length})</option>
+                        </select>
+                      </div>
+
+                      {msgAudience === 'selected' && (
+                        <div className="space-y-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-medium text-slate-700 tabular-nums">
+                              Recipients ({msgSelectedIds.length} chosen)
+                            </span>
+                            {msgSelectedIds.length > 0 && (
+                              <button
+                                type="button"
+                                onClick={() => setMsgSelectedIds([])}
+                                className="text-xs text-slate-600 hover:text-slate-900 underline"
+                              >
+                                Clear selection
+                              </button>
+                            )}
+                          </div>
+                          <div className="relative">
+                            <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                            <input
+                              type="search"
+                              value={msgRecipientSearch}
+                              onChange={(e) => setMsgRecipientSearch(e.target.value)}
+                              placeholder="Filter by name, username, role..."
+                              className="w-full pl-8 pr-3 py-1.5 text-xs border border-slate-300 rounded-lg"
+                            />
+                          </div>
+                          <div className="max-h-48 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
+                            {filteredRecipients.length === 0 ? (
+                              <p className="p-3 text-xs text-slate-500">No active recipients match filter.</p>
+                            ) : (
+                              filteredRecipients.map((r) => {
+                                const checked = msgSelectedIds.includes(r.id);
+                                return (
+                                  <label
+                                    key={r.id}
+                                    className="flex items-start gap-2.5 p-2.5 text-xs hover:bg-slate-50 cursor-pointer"
+                                  >
+                                    <input
+                                      type="checkbox"
+                                      checked={checked}
+                                      onChange={() => toggleRecipientId(r.id)}
+                                      className="mt-0.5 rounded border-slate-300"
+                                    />
+                                    <div className="min-w-0 flex-1">
+                                      <p className="font-semibold text-slate-900 truncate">
+                                        {r.fullName}{' '}
+                                        <span className="font-mono font-normal text-slate-500">({r.username})</span>
+                                      </p>
+                                      <p className="text-slate-500 truncate">
+                                        <span className="uppercase font-semibold text-slate-700">{r.role}</span> ·{' '}
+                                        {r.email || 'no email'} · {r.mobileMasked}
+                                      </p>
+                                    </div>
+                                  </label>
+                                );
+                              })
+                            )}
+                          </div>
+                        </div>
+                      )}
+
+                      <div>
+                        <span className="block text-xs font-medium text-slate-700 mb-1.5">Delivery Channels</span>
+                        <div className="grid grid-cols-3 gap-2 text-xs">
+                          <label className="flex items-center gap-2 p-2 border border-slate-200 rounded-lg cursor-pointer hover:bg-slate-50">
+                            <input
+                              type="checkbox"
+                              checked={msgChannels.sms}
+                              onChange={(e) => setMsgChannels((prev) => ({ ...prev, sms: e.target.checked }))}
+                            />
+                            <span>SMS</span>
+                          </label>
+                          <label className="flex items-center gap-2 p-2 border border-slate-200 rounded-lg cursor-pointer hover:bg-slate-50">
+                            <input
+                              type="checkbox"
+                              checked={msgChannels.email}
+                              onChange={(e) => setMsgChannels((prev) => ({ ...prev, email: e.target.checked }))}
+                            />
+                            <span>Email</span>
+                          </label>
+                          <label className="flex items-center gap-2 p-2 border border-slate-200 rounded-lg cursor-pointer hover:bg-slate-50">
+                            <input
+                              type="checkbox"
+                              checked={msgChannels.inApp}
+                              onChange={(e) => setMsgChannels((prev) => ({ ...prev, inApp: e.target.checked }))}
+                            />
+                            <span>In-App</span>
+                          </label>
+                        </div>
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700 mb-1">
+                          Subject (used in Email &amp; Notice header)
+                        </label>
+                        <input
+                          type="text"
+                          maxLength={140}
+                          value={msgSubject}
+                          onChange={(e) => setMsgSubject(e.target.value)}
+                          placeholder="e.g. Branch Operations Update or Account Notice"
+                          className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
+                        />
+                      </div>
+
+                      <div>
+                        <div className="flex items-center justify-between mb-1">
+                          <label className="text-xs font-medium text-slate-700">Message</label>
+                          <span className="text-xs text-slate-400 tabular-nums">{msgBody.length}/1000</span>
+                        </div>
+                        <textarea
+                          required
+                          minLength={3}
+                          maxLength={1000}
+                          rows={4}
+                          value={msgBody}
+                          onChange={(e) => setMsgBody(e.target.value)}
+                          placeholder="Write your official message to the selected user(s) or employee(s)..."
+                          className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
+                        />
+                      </div>
+
+                      <button
+                        type="submit"
+                        disabled={msgBusy || targetRecipientCount === 0}
+                        className="w-full inline-flex items-center justify-center gap-2 py-2.5 px-4 text-xs font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 disabled:opacity-50"
+                      >
+                        <Send className="w-3.5 h-3.5" />
+                        {msgBusy
+                          ? 'Dispatching...'
+                          : `Send to ${targetRecipientCount} Recipient${targetRecipientCount === 1 ? '' : 's'}`}
+                      </button>
+                    </form>
+
+                    <div className="lg:col-span-7 bg-white border border-slate-200 rounded-xl p-6 space-y-4">
+                      <div>
+                        <h3 className="text-base font-bold text-slate-900">Dispatched Messages &amp; Email Log</h3>
+                        <p className="text-xs text-slate-500 mt-0.5">
+                          Delivery status across SMS, Email/Gmail API, and In-App Bank Alerts (contacts remain masked).
+                        </p>
+                      </div>
+
+                      {sentMessages.length === 0 ? (
+                        <EmptyState
+                          title="No manager notices sent yet"
+                          description="Messages and emails dispatched to users or employees will appear here with provider status."
+                        />
+                      ) : (
+                        <div className="divide-y divide-slate-100">
+                          {sentMessages.map((m) => (
+                            <div key={m.id} className="py-3.5 space-y-1">
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <p className="text-xs font-semibold text-slate-900">
+                                  {m.full_name}{' '}
+                                  <span className="font-mono font-normal text-slate-500">({m.username})</span> ·{' '}
+                                  <span className="uppercase text-slate-700">{m.role}</span>
+                                </p>
+                                <span
+                                  className={`text-xs font-mono ${
+                                    m.status === 'sent'
+                                      ? 'text-emerald-700 font-semibold'
+                                      : m.status === 'failed'
+                                        ? 'text-red-700 font-semibold'
+                                        : 'text-amber-700'
+                                  }`}
+                                >
+                                  {m.channel.toUpperCase()} · {m.status}
+                                </span>
+                              </div>
+                              <p className="text-xs text-slate-700">{m.message}</p>
+                              <p className="text-xs text-slate-500">
+                                {m.recipient_masked} · {m.provider}
+                                {m.provider_message_id ? ` · ${m.provider_message_id}` : ''} ·{' '}
+                                {formatDateTime(m.created_at)}
+                              </p>
+                              {m.error_message && <p className="text-xs text-red-700">{m.error_message}</p>}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })()}
 
               {tab === 'ledger' && (
                 <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-4">
@@ -812,15 +1370,32 @@ export function ManagerWorkspace({ user, onLogout }: { user: AuthUser; onLogout:
                 </div>
               )}
 
-              {tab === 'credentials' && (
+              {tab === 'credentials' && (() => {
+                const userCount = credentials.filter((c) => c.role === 'user').length;
+                const empCount = credentials.filter((c) => c.role === 'employee').length;
+                const selectedAtLimit =
+                  credRole === 'user'
+                    ? userCount >= accountLimits.maxUsers
+                    : empCount >= accountLimits.maxEmployees;
+
+                return (
                 <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
                   <form onSubmit={handleCreateCredential} className="lg:col-span-4 bg-white border border-slate-200 rounded-xl p-6 space-y-4">
                     <div>
                       <h2 className="text-base font-bold text-slate-900">Create User or Employee Login</h2>
-                      <p className="text-xs text-slate-500 mt-0.5">
-                        Saves username and salted scrypt-hashed password. Users must change temporary passwords on first sign-in.
+                      <p className="text-xs text-slate-500 mt-0.5 tabular-nums">
+                        Max {accountLimits.maxUsers} user IDs ({userCount}/{accountLimits.maxUsers}) · Max{' '}
+                        {accountLimits.maxEmployees} employees ({empCount}/{accountLimits.maxEmployees})
                       </p>
                     </div>
+
+                    {selectedAtLimit && (
+                      <div role="alert" className="p-3 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-900">
+                        {credRole === 'employee'
+                          ? `Maximum limit of ${accountLimits.maxEmployees} employees reached. Delete an existing employee first.`
+                          : `Maximum limit of ${accountLimits.maxUsers} user IDs reached. Delete an existing user first.`}
+                      </div>
+                    )}
 
                     {credError && (
                       <div role="alert" className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-800">
@@ -835,8 +1410,12 @@ export function ManagerWorkspace({ user, onLogout }: { user: AuthUser; onLogout:
                         onChange={(e) => setCredRole(e.target.value as 'user' | 'employee')}
                         className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white"
                       >
-                        <option value="user">User (Customer Login)</option>
-                        <option value="employee">Employee (Teller Login)</option>
+                        <option value="user">
+                          User (Customer Login · {userCount}/{accountLimits.maxUsers})
+                        </option>
+                        <option value="employee">
+                          Employee (Teller Login · {empCount}/{accountLimits.maxEmployees})
+                        </option>
                       </select>
                     </div>
                     <div>
@@ -909,7 +1488,8 @@ export function ManagerWorkspace({ user, onLogout }: { user: AuthUser; onLogout:
                     </div>
                     <button
                       type="submit"
-                      className="w-full py-2.5 px-4 text-xs font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800"
+                      disabled={selectedAtLimit}
+                      className="w-full py-2.5 px-4 text-xs font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       Save {credRole === 'employee' ? 'Employee' : 'User'} Login
                     </button>
@@ -919,31 +1499,68 @@ export function ManagerWorkspace({ user, onLogout }: { user: AuthUser; onLogout:
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <div>
                         <h3 className="text-base font-bold text-slate-900">Saved User &amp; Employee Credentials</h3>
-                        <p className="text-xs text-slate-500 mt-0.5">
-                          All passwords are stored as one-way salted scrypt hashes. Managers can reset temporary passwords or unlock accounts with an audit trail.
+                        <p className="text-xs text-slate-500 mt-0.5 tabular-nums">
+                          {userCount} / {accountLimits.maxUsers} users · {empCount} / {accountLimits.maxEmployees} employees · Salted scrypt hashes
                         </p>
                       </div>
-                      <div className="flex gap-1 p-1 bg-slate-100 rounded-lg">
-                        {(['all', 'user', 'employee'] as const).map((f) => (
-                          <button
-                            key={f}
-                            type="button"
-                            onClick={() => setCredFilter(f)}
-                            className={`px-2.5 py-1 text-xs font-medium rounded capitalize ${
-                              credFilter === f ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'
-                            }`}
-                          >
-                            {f === 'all' ? 'All' : `${f}s`}
-                          </button>
-                        ))}
+                      <div className="flex flex-wrap items-center gap-2">
+                        <div className="relative">
+                          <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                          <input
+                            type="search"
+                            value={credSearch}
+                            onChange={(e) => setCredSearch(e.target.value)}
+                            placeholder="Search name or username..."
+                            className="pl-8 pr-3 py-1.5 text-xs border border-slate-300 rounded-lg w-48"
+                          />
+                        </div>
+                        <div className="flex gap-1 p-1 bg-slate-100 rounded-lg">
+                          {(['all', 'user', 'employee'] as const).map((f) => {
+                            const label =
+                              f === 'all'
+                                ? `All (${credentials.length})`
+                                : f === 'user'
+                                  ? `Users (${userCount}/${accountLimits.maxUsers})`
+                                  : `Employees (${empCount}/${accountLimits.maxEmployees})`;
+                            return (
+                              <button
+                                key={f}
+                                type="button"
+                                onClick={() => setCredFilter(f)}
+                                className={`px-2.5 py-1 text-xs font-medium rounded whitespace-nowrap shrink-0 tabular-nums ${
+                                  credFilter === f ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'
+                                }`}
+                              >
+                                {label}
+                              </button>
+                            );
+                          })}
+                        </div>
                       </div>
                     </div>
 
-                    <div className="divide-y divide-slate-100">
+                    {credentials.length === 0 ? (
+                      <EmptyState
+                        title="No user or employee logins yet"
+                        description="Create up to 20 user IDs and 5 employee IDs using the form on the left."
+                      />
+                    ) : (
+                      <div className="divide-y divide-slate-100">
                       {credentials
                         .filter((c) => credFilter === 'all' || c.role === credFilter)
+                        .filter((c) => {
+                          const q = credSearch.trim().toLowerCase();
+                          if (!q) return true;
+                          return (
+                            c.username.toLowerCase().includes(q) ||
+                            c.fullName.toLowerCase().includes(q) ||
+                            (c.email?.toLowerCase().includes(q) ?? false) ||
+                            (c.accountMasked?.toLowerCase().includes(q) ?? false)
+                          );
+                        })
                         .map((cred) => {
                           const isLocked = Boolean(cred.lockedUntil && new Date(cred.lockedUntil).getTime() > Date.now());
+                          const isConfirmingDelete = confirmDeleteId === cred.id;
                           return (
                             <div key={cred.id} className="py-4 space-y-2.5">
                               <div className="flex flex-wrap items-center justify-between gap-2">
@@ -953,7 +1570,7 @@ export function ManagerWorkspace({ user, onLogout }: { user: AuthUser; onLogout:
                                     <span className="font-mono text-xs text-slate-600">({cred.username})</span>
                                   </p>
                                   <p className="text-xs text-slate-500 mt-0.5">
-                                    Role: <span className="font-semibold uppercase text-slate-700">{cred.role}</span> ·{' '}
+                                    <span className="font-semibold uppercase text-slate-700">{cred.role}</span> ·{' '}
                                     {cred.accountMasked ? `Account ${cred.accountMasked}` : cred.department || 'Staff'} ·{' '}
                                     {cred.mobileMasked} · {cred.passwordProtection}
                                   </p>
@@ -976,7 +1593,7 @@ export function ManagerWorkspace({ user, onLogout }: { user: AuthUser; onLogout:
                                 </div>
                               </div>
 
-                              <div className="flex flex-col sm:flex-row gap-2">
+                              <div className="flex flex-wrap gap-2">
                                 <input
                                   type="password"
                                   value={resetPasswords[cred.id] || ''}
@@ -984,7 +1601,7 @@ export function ManagerWorkspace({ user, onLogout }: { user: AuthUser; onLogout:
                                     setResetPasswords((prev) => ({ ...prev, [cred.id]: e.target.value }))
                                   }
                                   placeholder="New temp password (min 8 chars)"
-                                  className="flex-1 px-3 py-1.5 text-xs border border-slate-300 rounded-lg"
+                                  className="flex-1 min-w-44 px-3 py-1.5 text-xs border border-slate-300 rounded-lg"
                                 />
                                 <input
                                   type="text"
@@ -993,12 +1610,20 @@ export function ManagerWorkspace({ user, onLogout }: { user: AuthUser; onLogout:
                                     setReasonInputs((prev) => ({ ...prev, [cred.id]: e.target.value }))
                                   }
                                   placeholder="Audit reason..."
-                                  className="flex-1 px-3 py-1.5 text-xs border border-slate-300 rounded-lg"
+                                  className="flex-1 min-w-36 px-3 py-1.5 text-xs border border-slate-300 rounded-lg"
                                 />
                                 <button
                                   type="button"
+                                  onClick={() => jumpToMessageRecipient(cred.id)}
+                                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 border border-slate-300 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0"
+                                >
+                                  <Mail className="w-3.5 h-3.5" />
+                                  Message
+                                </button>
+                                <button
+                                  type="button"
                                   onClick={() => void handleResetCredentialPassword(cred)}
-                                  className="px-3 py-1.5 text-xs font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800 whitespace-nowrap"
+                                  className="px-3 py-1.5 text-xs font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800 whitespace-nowrap shrink-0"
                                 >
                                   Reset Password
                                 </button>
@@ -1006,63 +1631,183 @@ export function ManagerWorkspace({ user, onLogout }: { user: AuthUser; onLogout:
                                   <button
                                     type="button"
                                     onClick={() => void handleUnlockCredential(cred)}
-                                    className="px-3 py-1.5 text-xs font-medium text-amber-800 border border-amber-300 bg-amber-50 rounded-lg hover:bg-amber-100 whitespace-nowrap"
+                                    className="px-3 py-1.5 text-xs font-medium text-amber-800 border border-amber-300 bg-amber-50 rounded-lg hover:bg-amber-100 whitespace-nowrap shrink-0"
                                   >
                                     Unlock
+                                  </button>
+                                )}
+                                {isConfirmingDelete ? (
+                                  <>
+                                    <button
+                                      type="button"
+                                      disabled={deletingId === cred.id}
+                                      onClick={() => void handleDeleteAccount(cred.id, cred.username)}
+                                      className="px-3 py-1.5 text-xs font-semibold text-white bg-red-700 rounded-lg hover:bg-red-800 disabled:opacity-60 whitespace-nowrap shrink-0"
+                                    >
+                                      {deletingId === cred.id ? 'Deleting...' : 'Confirm Delete'}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => setConfirmDeleteId(null)}
+                                      className="px-3 py-1.5 text-xs font-medium text-slate-700 border border-slate-300 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0"
+                                    >
+                                      Cancel
+                                    </button>
+                                  </>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    onClick={() => setConfirmDeleteId(cred.id)}
+                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-red-700 border border-red-300 rounded-lg hover:bg-red-50 whitespace-nowrap shrink-0"
+                                  >
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                    Delete
                                   </button>
                                 )}
                               </div>
                             </div>
                           );
                         })}
-                    </div>
+                      </div>
+                    )}
                   </div>
                 </div>
-              )}
+                );
+              })()}
 
               {tab === 'integrations' && (
-                <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-5">
-                  <div className="flex flex-wrap items-center justify-between gap-4">
-                    <div>
-                      <h2 className="text-lg font-bold text-slate-900">Provider Adapters &amp; Production Readiness</h2>
-                      <p className="text-xs text-slate-500 mt-0.5">
-                        External banking, UPI, Aadhaar KYC, and SMS providers operate in sandbox mode until production credentials and regulatory approvals are configured.
-                      </p>
+                <div className="space-y-6">
+                  <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-5">
+                    <div className="flex flex-wrap items-center justify-between gap-4">
+                      <div>
+                        <h2 className="text-lg font-bold text-slate-900">Provider Adapters &amp; Production Readiness</h2>
+                        <p className="text-xs text-slate-500 mt-0.5">
+                          External banking, UPI, Aadhaar KYC, SMS, and Gmail/Email providers support live API keys via environment variables or Google Sign-In OAuth.
+                        </p>
+                      </div>
+                      <div className="flex gap-2">
+                        <a
+                          href="/api/openapi.json"
+                          target="_blank"
+                          rel="noreferrer"
+                          className="px-3.5 py-2 text-xs font-medium text-slate-700 border border-slate-300 rounded-lg hover:bg-slate-50"
+                        >
+                          OpenAPI 3.1 JSON
+                        </a>
+                        <a
+                          href="/api/docs"
+                          target="_blank"
+                          rel="noreferrer"
+                          className="px-3.5 py-2 text-xs font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800"
+                        >
+                          API Reference Viewer
+                        </a>
+                      </div>
                     </div>
-                    <div className="flex gap-2">
-                      <a
-                        href="/api/openapi.json"
-                        target="_blank"
-                        rel="noreferrer"
-                        className="px-3.5 py-2 text-xs font-medium text-slate-700 border border-slate-300 rounded-lg hover:bg-slate-50"
-                      >
-                        OpenAPI 3.1 JSON
-                      </a>
-                      <a
-                        href="/api/docs"
-                        target="_blank"
-                        rel="noreferrer"
-                        className="px-3.5 py-2 text-xs font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800"
-                      >
-                        API Reference Viewer
-                      </a>
+
+                    <div className="divide-y divide-slate-100">
+                      {overview.integrations.map((intg) => (
+                        <div key={intg.name} className="py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                          <div>
+                            <p className="text-sm font-semibold text-slate-900">{intg.name}</p>
+                            <p className="text-xs text-slate-500 mt-0.5">{intg.requirements}</p>
+                          </div>
+                          <div className="text-right shrink-0 space-y-0.5">
+                            <span
+                              className={`text-xs font-mono font-semibold uppercase ${
+                                intg.mode === 'live'
+                                  ? intg.configured
+                                    ? 'text-emerald-700'
+                                    : 'text-red-700'
+                                  : 'text-amber-700'
+                              }`}
+                            >
+                              {intg.mode} mode {intg.adapter && intg.adapter !== 'none' ? `· ${intg.adapter}` : ''}
+                            </span>
+                            <p className="text-xs text-slate-500">
+                              {intg.configured ? 'Credentials ready' : 'Awaiting env credentials'}
+                            </p>
+                          </div>
+                        </div>
+                      ))}
                     </div>
                   </div>
 
-                  <div className="divide-y divide-slate-100">
-                    {overview.integrations.map((intg) => (
-                      <div key={intg.name} className="py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                        <div>
-                          <p className="text-sm font-semibold text-slate-900">{intg.name}</p>
-                          <p className="text-xs text-slate-500 mt-0.5">{intg.requirements}</p>
-                        </div>
-                        <div className="text-right shrink-0">
-                          <span className="text-xs font-mono font-semibold text-amber-700 uppercase">
-                            {intg.mode} mode
-                          </span>
-                        </div>
+                  <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-4">
+                    <div className="flex flex-wrap items-center justify-between gap-4">
+                      <div>
+                        <h3 className="text-base font-bold text-slate-900">Test Live SMS &amp; Gmail Notification API</h3>
+                        <p className="text-xs text-slate-500 mt-0.5">
+                          Verify real Twilio/MSG91/Fast2SMS SMS or Gmail API / Gmail SMTP / Resend delivery without affecting ledger balances.
+                        </p>
                       </div>
-                    ))}
+                      {mgrGoogleToken ? (
+                        <div className="flex items-center gap-2 text-xs">
+                          <span className="font-mono text-emerald-700">
+                            Gmail connected ({mgrGoogleUser?.email || 'Google'})
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => void googleSignOut().then(() => setMgrGoogleToken(null))}
+                            className="px-2.5 py-1 border border-slate-300 rounded-lg text-slate-700 hover:bg-slate-50"
+                          >
+                            Disconnect
+                          </button>
+                        </div>
+                      ) : (
+                        <GoogleSignInButton
+                          onClick={() => void handleManagerGoogleSignIn()}
+                          label="Connect Gmail for Testing"
+                        />
+                      )}
+                    </div>
+
+                    <form onSubmit={handlePreSubmitTestNotification} className="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
+                      <div className="md:col-span-2">
+                        <label className="block text-xs font-medium text-slate-700 mb-1">Channel</label>
+                        <select
+                          value={diagChannel}
+                          onChange={(e) => setDiagChannel(e.target.value as 'sms' | 'email')}
+                          className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white"
+                        >
+                          <option value="email">Gmail / Email</option>
+                          <option value="sms">Mobile SMS</option>
+                        </select>
+                      </div>
+                      <div className="md:col-span-4">
+                        <label className="block text-xs font-medium text-slate-700 mb-1">
+                          {diagChannel === 'email' ? 'Recipient Gmail / Email' : 'Recipient Mobile (+91...)'}
+                        </label>
+                        <input
+                          type={diagChannel === 'email' ? 'email' : 'tel'}
+                          required
+                          value={diagRecipient}
+                          onChange={(e) => setDiagRecipient(e.target.value)}
+                          placeholder={diagChannel === 'email' ? 'recipient@gmail.com' : '+919800001001'}
+                          className="w-full px-3 py-2 text-sm font-mono border border-slate-300 rounded-lg"
+                        />
+                      </div>
+                      <div className="md:col-span-4">
+                        <label className="block text-xs font-medium text-slate-700 mb-1">Test Message</label>
+                        <input
+                          type="text"
+                          required
+                          value={diagMessage}
+                          onChange={(e) => setDiagMessage(e.target.value)}
+                          className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
+                        />
+                      </div>
+                      <div className="md:col-span-2">
+                        <button
+                          type="submit"
+                          disabled={diagBusy}
+                          className="w-full inline-flex items-center justify-center gap-1.5 py-2.5 px-3 text-xs font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 disabled:opacity-60 whitespace-nowrap"
+                        >
+                          <Send className="w-3.5 h-3.5" />
+                          {diagBusy ? 'Sending...' : 'Send Test'}
+                        </button>
+                      </div>
+                    </form>
                   </div>
                 </div>
               )}
@@ -1070,6 +1815,95 @@ export function ManagerWorkspace({ user, onLogout }: { user: AuthUser; onLogout:
           )}
         </main>
       </div>
+
+      {diagConfirmGmailOpen && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-xl p-6 max-w-md w-full space-y-4">
+            <div className="flex items-center gap-2 text-emerald-700">
+              <Mail className="w-5 h-5" />
+              <h3 className="text-base font-bold text-slate-900">Confirm Sending Test Email via Gmail</h3>
+            </div>
+            <p className="text-xs text-slate-600">
+              Send diagnostic email to <span className="font-mono text-slate-900">{diagRecipient}</span> using your connected Gmail account ({mgrGoogleUser?.email || 'Google'})?
+            </p>
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                disabled={diagBusy}
+                onClick={() => void runTestNotification(true)}
+                className="flex-1 py-2.5 px-4 text-xs font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800 disabled:opacity-60"
+              >
+                {diagBusy ? 'Sending...' : 'Confirm & Send Email'}
+              </button>
+              <button
+                type="button"
+                disabled={diagBusy}
+                onClick={() => setDiagConfirmGmailOpen(false)}
+                className="py-2.5 px-4 text-xs font-medium text-slate-700 border border-slate-300 rounded-lg hover:bg-slate-50"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {msgConfirmGmailOpen && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-xl p-6 max-w-md w-full space-y-4">
+            <div className="flex items-center gap-2 text-emerald-700">
+              <Mail className="w-5 h-5" />
+              <h3 className="text-base font-bold text-slate-900">Confirm Sending Emails via Gmail</h3>
+            </div>
+            <div className="border-y border-slate-200 py-3 space-y-2 text-xs">
+              <div className="flex justify-between gap-4">
+                <span className="text-slate-500">Sender Gmail</span>
+                <span className="font-mono text-slate-900">{mgrGoogleUser?.email || 'Connected Google Account'}</span>
+              </div>
+              <div className="flex justify-between gap-4">
+                <span className="text-slate-500">Audience</span>
+                <span className="font-semibold text-slate-900">
+                  {msgAudience === 'all'
+                    ? 'All Active Users & Employees'
+                    : msgAudience === 'all_users'
+                      ? 'All Active Users'
+                      : msgAudience === 'all_employees'
+                        ? 'All Active Employees'
+                        : `${msgSelectedIds.length} Selected Recipient(s)`}
+                </span>
+              </div>
+              <div className="flex justify-between gap-4">
+                <span className="text-slate-500">Subject</span>
+                <span className="text-slate-900 text-right">
+                  {msgSubject.trim() || 'Notice from Meridian Trust Bank Management'}
+                </span>
+              </div>
+            </div>
+            <p className="text-xs text-slate-600">
+              Confirming will dispatch email(s) through your connected Google Workspace Gmail account
+              {msgChannels.sms ? ' along with SMS alerts' : ''}.
+            </p>
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                disabled={msgBusy}
+                onClick={() => void executeSendManagerMessage(true)}
+                className="flex-1 py-2.5 px-4 text-xs font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800 disabled:opacity-60"
+              >
+                {msgBusy ? 'Sending...' : 'Confirm & Dispatch'}
+              </button>
+              <button
+                type="button"
+                disabled={msgBusy}
+                onClick={() => setMsgConfirmGmailOpen(false)}
+                className="py-2.5 px-4 text-xs font-medium text-slate-700 border border-slate-300 rounded-lg hover:bg-slate-50"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

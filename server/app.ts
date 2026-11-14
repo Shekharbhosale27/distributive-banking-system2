@@ -2,6 +2,8 @@ import express from 'express';
 import type Database from 'better-sqlite3';
 import { AppConfig } from './config.ts';
 import { createAuthMiddleware, securityHeadersMiddleware } from './middleware/security.ts';
+import { resolveActiveEmailAdapter } from './providers/emailProvider.ts';
+import { resolveActiveSmsAdapter } from './providers/smsProvider.ts';
 import { buildOpenApiSpec, renderApiDocsHtml } from './openapi.ts';
 import { createAuthRouter } from './routes/authRoutes.ts';
 import { createCustomerRouter } from './routes/customerRoutes.ts';
@@ -25,6 +27,9 @@ export function createBankApp(params: { db: Database.Database; config: AppConfig
         payment: config.paymentProviderMode,
         kyc: config.kycProviderMode,
         sms: config.smsProviderMode,
+        smsAdapter: resolveActiveSmsAdapter(config),
+        email: config.emailProviderMode,
+        emailAdapter: resolveActiveEmailAdapter(config),
       },
       devSeedEnabled: config.allowDevSeed,
     });

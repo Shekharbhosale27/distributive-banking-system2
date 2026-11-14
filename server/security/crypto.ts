@@ -76,3 +76,16 @@ export function maskAadhaarLast4(aadhaarDigits: string): string {
   if (digits.length < 4) return 'XXXX-XXXX-XXXX';
   return `XXXX-XXXX-${digits.slice(-4)}`;
 }
+
+export function maskEmail(email: string | null | undefined): string {
+  if (!email) return 'N/A';
+  const cleaned = email.trim();
+  const atIndex = cleaned.indexOf('@');
+  if (atIndex <= 0) return '***';
+  const local = cleaned.slice(0, atIndex);
+  const domain = cleaned.slice(atIndex + 1);
+  if (local.length <= 2) {
+    return `${local[0] || '*'}***@${domain}`;
+  }
+  return `${local.slice(0, 2)}***${local.slice(-1)}@${domain}`;
+}

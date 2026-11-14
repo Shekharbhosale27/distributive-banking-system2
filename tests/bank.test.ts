@@ -305,10 +305,18 @@ describe('Meridian Trust Bank — Security, RBAC, Ledger & Payments', () => {
     expect(JSON.stringify(userRow)).not.toContain(validAadhaar);
     expect(JSON.stringify(auditRows)).not.toContain(validAadhaar);
     // SMS delivery failure was logged without breaking customer onboarding/opening deposit
-    const failedSms = db.prepare(`SELECT status FROM notifications WHERE user_id = ?`).get(onboard.body.customer.userId) as {
+    const failedSms = db
+      .prepare(`SELECT status FROM notifications WHERE user_id = ? AND channel = 'sms'`)
+      .get(onboard.body.customer.userId) as {
       status: string;
     };
     expect(failedSms.status).toBe('failed');
+    const emailNotif = db
+      .prepare(`SELECT status FROM notifications WHERE user_id = ? AND channel = 'email'`)
+      .get(onboard.body.customer.userId) as {
+      status: string;
+    };
+    expect(emailNotif.status).toBe('sandbox_logged');
 
     // Employee adjustment limit enforcement
     const overEmpLimit = await emp.agent
@@ -504,5 +512,476 @@ describe('Meridian Trust Bank — Security, RBAC, Ledger & Payments', () => {
       .send({ username: 'ananya.rao', password: 'ResetTemp#2026', expectedRole: 'user' });
     expect(resetLogin.status).toBe(200);
     expect(resetLogin.body.user.mustChangePassword).toBe(true);
+  });
+
+  it('enforces max 20 users and 5 employees creation caps and allows manager to delete users and employees safely', async () => {
+    const mgrAgent = request.agent(app);
+    const mgrLogin = await mgrAgent
+      .post('/api/auth/login')
+      .send({ username: 'manager', password: '1234', expectedRole: 'manager' });
+    expect(mgrLogin.status).toBe(200);
+    const mgrCsrf = mgrLogin.body.csrfToken as string;
+
+    await mgrAgent
+      .post('/api/auth/change-password')
+      .set('X-CSRF-Token', mgrCsrf)
+      .send({ currentPassword: '1234', newPassword: 'ManagerSecure#2026' });
+
+    const initialDir = await mgrAgent.get('/api/manager/credentials');
+    expect(initialDir.status).toBe(200);
+    expect(initialDir.body.limits).toEqual({
+      maxUsers: 20,
+      maxEmployees: 5,
+      currentUsers: 3,
+      currentEmployees: 2,
+    });
+
+    // 1. Fill remaining 3 employee slots (2 baseline -> 5 total), then 6th employee must fail
+    for (let i = 3; i <= 5; i++) {
+      const empCreate = await mgrAgent
+        .post('/api/manager/credentials/create')
+        .set('X-CSRF-Token', mgrCsrf)
+        .send({
+          username: `teller.cap${i}`,
+          fullName: `Teller Cap ${i}`,
+          email: `teller.cap${i}@gmail.com`,
+          mobile: `+91983333000${i}`,
+          role: 'employee',
+          temporaryPassword: 'TempStaff#2026',
+          department: 'Operations',
+        });
+      expect(empCreate.status).toBe(201);
+    }
+
+    const sixthEmp = await mgrAgent
+      .post('/api/manager/credentials/create')
+      .set('X-CSRF-Token', mgrCsrf)
+      .send({
+        username: 'teller.cap6',
+        fullName: 'Teller Cap 6',
+        email: 'teller.cap6@gmail.com',
+        mobile: '+919833330006',
+        role: 'employee',
+        temporaryPassword: 'TempStaff#2026',
+      });
+    expect(sixthEmp.status).toBe(409);
+    expect(sixthEmp.body.error).toBe('EMPLOYEE_LIMIT_REACHED');
+
+    const sixthInvite = await mgrAgent
+      .post('/api/manager/employees/invite')
+      .set('X-CSRF-Token', mgrCsrf)
+      .send({
+        fullName: 'Teller Cap 6 Invite',
+        email: 'teller.cap6.inv@gmail.com',
+        mobile: '+919833330016',
+        department: 'Audit',
+      });
+    expect(sixthInvite.status).toBe(409);
+    expect(sixthInvite.body.error).toBe('EMPLOYEE_LIMIT_REACHED');
+
+    // 2. Fill remaining 17 user slots (3 baseline -> 20 total), then 21st user must fail
+    for (let i = 4; i <= 20; i++) {
+      const pad = String(i).padStart(2, '0');
+      const usrCreate = await mgrAgent
+        .post('/api/manager/credentials/create')
+        .set('X-CSRF-Token', mgrCsrf)
+        .send({
+          username: `user.cap${pad}`,
+          fullName: `User Cap ${pad}`,
+          email: `user.cap${pad}@example.com`,
+          mobile: `+9198444400${pad}`,
+          role: 'user',
+          temporaryPassword: 'TempUser#2026',
+        });
+      expect(usrCreate.status).toBe(201);
+    }
+
+    const twentyFirstUser = await mgrAgent
+      .post('/api/manager/credentials/create')
+      .set('X-CSRF-Token', mgrCsrf)
+      .send({
+        username: 'user.cap21',
+        fullName: 'User Cap 21',
+        email: 'user.cap21@example.com',
+        mobile: '+919844440021',
+        role: 'user',
+        temporaryPassword: 'TempUser#2026',
+      });
+    expect(twentyFirstUser.status).toBe(409);
+    expect(twentyFirstUser.body.error).toBe('USER_LIMIT_REACHED');
+
+    // Non-manager cannot delete users or employees
+    const cust = await loginAgent(app, 'aarav.sharma', 'Customer#2026');
+    expect(
+      (
+        await cust.agent
+          .delete(`/api/manager/credentials/${initialDir.body.credentials[0].id}`)
+          .set('X-CSRF-Token', cust.csrfToken)
+          .send({ reason: 'Unauthorized attempt' })
+      ).status,
+    ).toBe(403);
+
+    // 3. Manager deletes an active customer (aarav.sharma) and an employee (teller.priya)
+    const fullDir = await mgrAgent.get('/api/manager/credentials');
+    const creds = fullDir.body.credentials as Array<{ id: string; username: string; role: string }>;
+    const aaravCred = creds.find((c) => c.username === 'aarav.sharma')!;
+    const priyaCred = creds.find((c) => c.username === 'teller.priya')!;
+
+    const delUserRes = await mgrAgent
+      .delete(`/api/manager/credentials/${aaravCred.id}`)
+      .set('X-CSRF-Token', mgrCsrf)
+      .send({ reason: 'Customer requested account closure' });
+    expect(delUserRes.status).toBe(200);
+    expect(delUserRes.body.deleted.settledBalancePaise).toBeGreaterThan(0);
+
+    const aaravLogin = await request(app)
+      .post('/api/auth/login')
+      .send({ username: 'aarav.sharma', password: 'Customer#2026', expectedRole: 'user' });
+    expect(aaravLogin.status).toBe(401);
+    expect(verifyLedgerZeroSum(db).balanced).toBe(true);
+
+    const delEmpRes = await mgrAgent
+      .delete(`/api/manager/credentials/${priyaCred.id}`)
+      .set('X-CSRF-Token', mgrCsrf)
+      .send({ reason: 'Staff offboarding completed' });
+    expect(delEmpRes.status).toBe(200);
+
+    const priyaLogin = await request(app)
+      .post('/api/auth/login')
+      .send({ username: 'teller.priya', password: 'BankStaff#2026', expectedRole: 'employee' });
+    expect(priyaLogin.status).toBe(401);
+
+    // 4. Freed slots now allow creating 1 new user and 1 new employee
+    const replacementUser = await mgrAgent
+      .post('/api/manager/credentials/create')
+      .set('X-CSRF-Token', mgrCsrf)
+      .send({
+        username: 'user.replacement',
+        fullName: 'Replacement User',
+        email: 'replacement.user@example.com',
+        mobile: '+919844440099',
+        role: 'user',
+        temporaryPassword: 'TempUser#2026',
+      });
+    expect(replacementUser.status).toBe(201);
+
+    const replacementEmp = await mgrAgent
+      .post('/api/manager/credentials/create')
+      .set('X-CSRF-Token', mgrCsrf)
+      .send({
+        username: 'teller.replacement',
+        fullName: 'Replacement Teller',
+        email: 'replacement.teller@gmail.com',
+        mobile: '+919833330099',
+        role: 'employee',
+        temporaryPassword: 'TempStaff#2026',
+      });
+    expect(replacementEmp.status).toBe(201);
+
+    // Manager cannot delete a manager account
+    const delSelfRes = await mgrAgent
+      .delete(`/api/manager/credentials/${mgrLogin.body.user.id}`)
+      .set('X-CSRF-Token', mgrCsrf)
+      .send({ reason: 'Should fail' });
+    expect(delSelfRes.status).toBe(404);
+
+    // Audit trail recorded both deletions
+    const delLogs = db
+      .prepare(`SELECT action FROM audit_logs WHERE action IN ('USER_DELETED', 'EMPLOYEE_DELETED')`)
+      .all();
+    expect(delLogs.length).toBe(2);
+  });
+
+  it('allows employees to view all bank-wide transaction history with filters and blocks customer access', async () => {
+    const emp = await loginAgent(app, 'teller.priya', 'BankStaff#2026');
+    const cust = await loginAgent(app, 'aarav.sharma', 'Customer#2026');
+
+    // Customer must be blocked from employee bank-wide transaction history
+    expect((await cust.agent.get('/api/employee/transactions')).status).toBe(403);
+
+    // Employee retrieves all seeded and new bank transactions
+    const allTxRes = await emp.agent.get('/api/employee/transactions');
+    expect(allTxRes.status).toBe(200);
+    expect(allTxRes.body.totalCount).toBeGreaterThanOrEqual(6);
+    expect(allTxRes.body.transactions.length).toBe(allTxRes.body.totalCount);
+
+    // Secrets and raw KYC data must never leak
+    const serialized = JSON.stringify(allTxRes.body);
+    expect(serialized).not.toContain('password_hash');
+    expect(serialized).not.toContain('kyc_provider_ref');
+
+    // Status filter works (e.g. pending NEFT transfer)
+    const pendingRes = await emp.agent.get('/api/employee/transactions?status=pending');
+    expect(pendingRes.status).toBe(200);
+    expect(pendingRes.body.transactions.every((t: { status: string }) => t.status === 'pending')).toBe(true);
+    expect(pendingRes.body.transactions.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('dispatches real HTTP SMS (Twilio), live Email (Resend), and confirmed 1P Gmail API alerts without failing ledger transactions', async () => {
+    const liveConfig = loadConfig({
+      nodeEnv: 'development',
+      isProduction: false,
+      allowDevSeed: true,
+      dbPath: ':memory:',
+      paymentWebhookSecret: 'test-webhook-secret',
+      smsProviderMode: 'live',
+      smsProvider: 'twilio',
+      smsProviderAccountSid: 'ACtest123456',
+      smsProviderAuthToken: 'auth_token_test',
+      smsProviderFromNumber: '+15005550006',
+      emailProviderMode: 'live',
+      emailProvider: 'resend',
+      resendApiKey: 're_test_key',
+      emailFromAddress: 'alerts@meridiantrust.test',
+    });
+    const liveDb = openDatabase(':memory:');
+    runMigrations(liveDb);
+    seedDatabase(liveDb, liveConfig);
+    const liveApp = createBankApp({ db: liveDb, config: liveConfig });
+
+    const calls: Array<{ url: string; headers: Record<string, string>; body: string }> = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const headersObj: Record<string, string> = {};
+      if (init?.headers) {
+        const h = new Headers(init.headers);
+        h.forEach((v, k) => {
+          headersObj[k.toLowerCase()] = v;
+        });
+      }
+      calls.push({ url, headers: headersObj, body: typeof init?.body === 'string' ? init.body : '' });
+
+      if (url.startsWith('https://api.twilio.com/')) {
+        return new Response(JSON.stringify({ sid: 'SM_LIVE_12345' }), { status: 201 });
+      }
+      if (url === 'https://api.resend.com/emails') {
+        return new Response(JSON.stringify({ id: 're_msg_98765' }), { status: 200 });
+      }
+      if (url === 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send') {
+        return new Response(JSON.stringify({ id: 'gmail_msg_555' }), { status: 200 });
+      }
+      return new Response('unexpected', { status: 500 });
+    }) as typeof fetch;
+
+    try {
+      const aarav = await loginAgent(liveApp, 'aarav.sharma', 'Customer#2026');
+      const transferRes = await aarav.agent
+        .post('/api/transfers/internal')
+        .set('X-CSRF-Token', aarav.csrfToken)
+        .send({
+          destinationAccountNumber: 'MTB00100002',
+          amountPaise: 25000,
+          description: 'Live alert check',
+          idempotencyKey: 'live-alert-tx-1',
+        });
+      expect(transferRes.status).toBe(201);
+
+      // Verify both Twilio SMS and Resend Email HTTP calls fired
+      expect(calls.some((c) => c.url.includes('api.twilio.com/2010-04-01/Accounts/ACtest123456/Messages.json'))).toBe(true);
+      expect(calls.some((c) => c.url === 'https://api.resend.com/emails')).toBe(true);
+
+      const notifRows = liveDb
+        .prepare(`SELECT channel, provider, provider_message_id, status FROM notifications WHERE user_id = ?`)
+        .all(aarav.res.body.user.id) as Array<{
+        channel: string;
+        provider: string;
+        provider_message_id: string;
+        status: string;
+      }>;
+      expect(notifRows.some((n) => n.channel === 'sms' && n.provider === 'sms_twilio' && n.provider_message_id === 'SM_LIVE_12345' && n.status === 'sent')).toBe(true);
+      expect(notifRows.some((n) => n.channel === 'email' && n.provider === 'resend' && n.provider_message_id === 're_msg_98765' && n.status === 'sent')).toBe(true);
+
+      // 1P Gmail API receipt requires token + explicit confirmed: true
+      const noTokenRes = await aarav.agent
+        .post('/api/notifications/send-gmail')
+        .set('X-CSRF-Token', aarav.csrfToken)
+        .send({ transactionId: transferRes.body.transaction.id, confirmed: true });
+      expect(noTokenRes.status).toBe(401);
+
+      const unconfirmedGmail = await aarav.agent
+        .post('/api/notifications/send-gmail')
+        .set('X-CSRF-Token', aarav.csrfToken)
+        .set('X-Gmail-Access-Token', 'ya29.test-oauth-token')
+        .send({ transactionId: transferRes.body.transaction.id, confirmed: false });
+      expect(unconfirmedGmail.status).toBe(400);
+      expect(unconfirmedGmail.body.error).toBe('CONFIRMATION_REQUIRED');
+
+      const sentGmail = await aarav.agent
+        .post('/api/notifications/send-gmail')
+        .set('X-CSRF-Token', aarav.csrfToken)
+        .set('X-Gmail-Access-Token', 'ya29.test-oauth-token')
+        .send({ transactionId: transferRes.body.transaction.id, confirmed: true });
+      expect(sentGmail.status).toBe(200);
+      expect(sentGmail.body.notification.provider).toBe('gmail_api');
+      expect(sentGmail.body.notification.providerMessageId).toBe('gmail_msg_555');
+
+      const gmailCall = calls.find((c) => c.url.includes('gmail.googleapis.com'));
+      expect(gmailCall?.headers.authorization).toBe('Bearer ya29.test-oauth-token');
+
+      // Even if external SMS/Email providers return 500 errors, ledger transfer STILL commits cleanly
+      globalThis.fetch = (async () => new Response(JSON.stringify({ message: 'Upstream gateway error' }), { status: 500 })) as typeof fetch;
+      const resilientTransfer = await aarav.agent
+        .post('/api/transfers/internal')
+        .set('X-CSRF-Token', aarav.csrfToken)
+        .send({
+          destinationAccountNumber: 'MTB00100002',
+          amountPaise: 10000,
+          idempotencyKey: 'live-alert-fail-isolation',
+        });
+      expect(resilientTransfer.status).toBe(201);
+      expect(verifyLedgerZeroSum(liveDb).balanced).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('allows managers to send SMS, email/Gmail, and in-app messages to specific or grouped users and employees while enforcing RBAC', async () => {
+    const liveConfig = loadConfig({
+      nodeEnv: 'development',
+      isProduction: false,
+      allowDevSeed: true,
+      dbPath: ':memory:',
+      paymentWebhookSecret: 'test-webhook-secret',
+      smsProviderMode: 'live',
+      smsProvider: 'twilio',
+      smsProviderAccountSid: 'ACtest123456',
+      smsProviderAuthToken: 'auth_token_test',
+      smsProviderFromNumber: '+15005550006',
+      emailProviderMode: 'live',
+      emailProvider: 'resend',
+      resendApiKey: 're_test_key',
+      emailFromAddress: 'alerts@meridiantrust.test',
+    });
+    const msgDb = openDatabase(':memory:');
+    runMigrations(msgDb);
+    seedDatabase(msgDb, liveConfig);
+    const msgApp = createBankApp({ db: msgDb, config: liveConfig });
+
+    const calls: Array<{ url: string; headers: Record<string, string>; body: string }> = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const headersObj: Record<string, string> = {};
+      if (init?.headers) {
+        const h = new Headers(init.headers);
+        h.forEach((v, k) => {
+          headersObj[k.toLowerCase()] = v;
+        });
+      }
+      calls.push({ url, headers: headersObj, body: typeof init?.body === 'string' ? init.body : '' });
+
+      if (url.startsWith('https://api.twilio.com/')) {
+        return new Response(JSON.stringify({ sid: 'SM_MGR_111' }), { status: 201 });
+      }
+      if (url === 'https://api.resend.com/emails') {
+        return new Response(JSON.stringify({ id: 're_mgr_222' }), { status: 200 });
+      }
+      if (url === 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send') {
+        return new Response(JSON.stringify({ id: 'gmail_mgr_333' }), { status: 200 });
+      }
+      return new Response('unexpected', { status: 500 });
+    }) as typeof fetch;
+
+    try {
+      const aarav = await loginAgent(msgApp, 'aarav.sharma', 'Customer#2026');
+      const priya = await loginAgent(msgApp, 'teller.priya', 'BankStaff#2026');
+
+      // Users & employees cannot access manager messaging endpoints
+      expect((await aarav.agent.get('/api/manager/messages')).status).toBe(403);
+      expect(
+        (
+          await priya.agent
+            .post('/api/manager/messages/send')
+            .set('X-CSRF-Token', priya.csrfToken)
+            .send({ audience: 'all_users', channels: ['in_app'], message: 'Unauthorized notice' })
+        ).status,
+      ).toBe(403);
+
+      const mgr = await loginAgent(msgApp, 'manager', '1234');
+      await mgr.agent
+        .post('/api/auth/change-password')
+        .set('X-CSRF-Token', mgr.csrfToken)
+        .send({ currentPassword: '1234', newPassword: 'ManagerSecure#2026' });
+
+      // 1P Gmail token requires confirmed: true
+      const unconfirmedRes = await mgr.agent
+        .post('/api/manager/messages/send')
+        .set('X-CSRF-Token', mgr.csrfToken)
+        .set('X-Gmail-Access-Token', 'ya29.mgr-oauth-token')
+        .send({
+          audience: 'selected',
+          recipientUserIds: [aarav.res.body.user.id],
+          channels: ['email'],
+          subject: 'Account Notice',
+          message: 'Please review your statement.',
+          confirmed: false,
+        });
+      expect(unconfirmedRes.status).toBe(400);
+      expect(unconfirmedRes.body.error).toBe('CONFIRMATION_REQUIRED');
+
+      // Manager sends SMS + 1P Gmail + In-App alert to selected user & employee
+      const sendRes = await mgr.agent
+        .post('/api/manager/messages/send')
+        .set('X-CSRF-Token', mgr.csrfToken)
+        .set('X-Gmail-Access-Token', 'ya29.mgr-oauth-token')
+        .send({
+          audience: 'selected',
+          recipientUserIds: [aarav.res.body.user.id, priya.res.body.user.id],
+          channels: ['sms', 'email', 'in_app'],
+          subject: 'Branch Security Briefing',
+          message: 'Mandatory audit window starts at 18:00 IST today.',
+          confirmed: true,
+        });
+      expect(sendRes.status).toBe(200);
+      expect(sendRes.body.summary).toEqual({
+        totalRecipients: 2,
+        smsSent: 2,
+        emailSent: 2,
+        inAppSent: 2,
+        failedCount: 0,
+      });
+
+      expect(calls.filter((c) => c.url.includes('api.twilio.com')).length).toBe(2);
+      expect(calls.filter((c) => c.url.includes('gmail.googleapis.com')).length).toBe(2);
+
+      // Manager sends bulk announcement to all active employees using server email gateway (Resend)
+      const bulkEmpRes = await mgr.agent
+        .post('/api/manager/messages/send')
+        .set('X-CSRF-Token', mgr.csrfToken)
+        .send({
+          audience: 'all_employees',
+          channels: ['email', 'in_app'],
+          subject: 'Teller Shift Schedule',
+          message: 'Updated KYC verification checklist is active.',
+        });
+      expect(bulkEmpRes.status).toBe(200);
+      expect(bulkEmpRes.body.summary.totalRecipients).toBeGreaterThanOrEqual(1);
+      expect(calls.some((c) => c.url === 'https://api.resend.com/emails')).toBe(true);
+
+      // Employee can view received manager messages & alerts in their inbox
+      const empNotifs = await priya.agent.get('/api/notifications');
+      expect(empNotifs.status).toBe(200);
+      expect(
+        empNotifs.body.notifications.some((n: { channel: string; message: string }) =>
+          n.channel === 'in_app' && n.message.includes('Branch Security Briefing'),
+        ),
+      ).toBe(true);
+
+      // Manager message log shows masked recipients and never exposes raw mobile or password hashes
+      const mgrLogRes = await mgr.agent.get('/api/manager/messages');
+      expect(mgrLogRes.status).toBe(200);
+      expect(mgrLogRes.body.messages.length).toBeGreaterThanOrEqual(6);
+      expect(JSON.stringify(mgrLogRes.body)).not.toContain('password_hash');
+
+      // Audit trail recorded MANAGER_MESSAGE_SENT
+      const msgAudit = msgDb
+        .prepare(`SELECT details_json FROM audit_logs WHERE action = 'MANAGER_MESSAGE_SENT'`)
+        .all() as Array<{ details_json: string }>;
+      expect(msgAudit.length).toBe(2);
+      expect(msgAudit[0].details_json).toContain('Branch Security Briefing');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

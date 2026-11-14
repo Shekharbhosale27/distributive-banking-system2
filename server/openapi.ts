@@ -5,7 +5,7 @@ export function buildOpenApiSpec(serverUrl: string) {
       title: 'Meridian Trust Bank API',
       version: '1.0.0',
       description:
-        'Role-based digital banking API featuring double-entry ledger integrity, idempotent transfers, QR payments, Aadhaar KYC provider integration, SMS notifications, and manager governance.',
+        'Role-based digital banking API featuring double-entry ledger integrity, idempotent transfers, QR payments, Aadhaar KYC provider integration, real SMS & Gmail/Email notifications, and manager governance.',
     },
     servers: [{ url: serverUrl }],
     components: {
@@ -84,7 +84,10 @@ export function buildOpenApiSpec(serverUrl: string) {
         post: { summary: 'Confirm and execute payment for an inspected QR token', responses: { '201': { description: 'QR payment committed' } } },
       },
       '/api/notifications': {
-        get: { summary: 'View SMS and in-app notification delivery log', responses: { '200': { description: 'Notification list' } } },
+        get: { summary: 'View SMS, Gmail/Email, and in-app notification delivery log', responses: { '200': { description: 'Notification list' } } },
+      },
+      '/api/notifications/send-gmail': {
+        post: { summary: 'Send a confirmed transaction receipt or alert via 1P Gmail API', responses: { '200': { description: 'Sent via Gmail API' }, '401': { description: 'Google sign-in required' } } },
       },
       '/api/help/tickets': {
         get: { summary: 'List user help tickets', responses: { '200': { description: 'Ticket list' } } },
@@ -99,6 +102,9 @@ export function buildOpenApiSpec(serverUrl: string) {
       },
       '/api/employee/adjustments': {
         post: { summary: 'Audited teller credit or debit with reason, limit enforcement, and confirmation (role: employee)', responses: { '201': { description: 'Adjustment posted' } } },
+      },
+      '/api/employee/transactions': {
+        get: { summary: 'View all bank-wide transaction history with search and status filters (role: employee)', responses: { '200': { description: 'Bank-wide transaction history' } } },
       },
       '/api/employee/help-tickets': {
         get: { summary: 'View customer support queue (role: employee)', responses: { '200': { description: 'Tickets' } } },
@@ -141,6 +147,21 @@ export function buildOpenApiSpec(serverUrl: string) {
       },
       '/api/manager/credentials/{id}/unlock': {
         post: { summary: 'Unlock locked user or employee account (role: manager)', responses: { '200': { description: 'Account unlocked' } } },
+      },
+      '/api/manager/credentials/{id}': {
+        delete: {
+          summary: 'Delete a user or employee account safely with ledger settlement and audit log (role: manager)',
+          responses: { '200': { description: 'Account deleted' }, '404': { description: 'User or employee not found' } },
+        },
+      },
+      '/api/manager/integrations/test-notification': {
+        post: { summary: 'Dispatch a test SMS or Gmail/Email alert through configured live or sandbox gateway (role: manager)', responses: { '200': { description: 'Diagnostic sent' } } },
+      },
+      '/api/manager/messages': {
+        get: { summary: 'List manager-dispatched SMS, email, and in-app communications log without raw PII (role: manager)', responses: { '200': { description: 'Dispatched messages' } } },
+      },
+      '/api/manager/messages/send': {
+        post: { summary: 'Send SMS message, email/Gmail, or in-app alert to selected or grouped users and employees (role: manager)', responses: { '200': { description: 'Messages dispatched' } } },
       },
       '/api/webhooks/payment-provider': {
         post: { summary: 'HMAC-signed payment provider settlement webhook', responses: { '200': { description: 'Webhook processed' } } },

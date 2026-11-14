@@ -6,6 +6,8 @@ import { generateId, generateReferenceCode, hashPassword } from '../security/cry
 
 export const SYSTEM_VAULT_ACCOUNT_ID = 'acct_sys_vault_0001';
 export const SYSTEM_CLEARING_ACCOUNT_ID = 'acct_sys_clearing_0001';
+export const MAX_USER_ACCOUNTS = 20;
+export const MAX_EMPLOYEE_ACCOUNTS = 5;
 
 export function openDatabase(dbPath: string): Database.Database {
   if (dbPath !== ':memory:') {
@@ -96,7 +98,7 @@ export function seedDatabase(db: Database.Database, config: AppConfig): void {
     return;
   }
 
-  // Only seed sample development data if database has no users yet
+  // Only seed baseline sample development data if database has no users yet
   const userCount = (db.prepare('SELECT COUNT(*) as cnt FROM users').get() as { cnt: number }).cnt;
   if (userCount > 0) {
     return;

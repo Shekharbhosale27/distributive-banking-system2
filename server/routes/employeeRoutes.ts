@@ -1,19 +1,26 @@
 import { Router } from 'express';
 import type Database from 'better-sqlite3';
 import { AppConfig } from '../config.ts';
-import { SYSTEM_VAULT_ACCOUNT_ID } from '../db/database.ts';
+import { MAX_USER_ACCOUNTS, SYSTEM_VAULT_ACCOUNT_ID } from '../db/database.ts';
 import { requireRole } from '../middleware/security.ts';
 import { verifyAadhaarWithProvider } from '../providers/kycProvider.ts';
-import { dispatchTransactionSms } from '../providers/smsProvider.ts';
+import { dispatchTransactionNotifications } from '../providers/emailProvider.ts';
 import { generateId, hashPassword } from '../security/crypto.ts';
 import { recordAuditLog } from '../services/auditService.ts';
 import { getAccountBalancePaise, LedgerError, postDoubleEntryTransaction } from '../services/ledgerService.ts';
 
 function generateNextAccountNumber(db: Database.Database): string {
-  const countRow = db.prepare(`SELECT COUNT(*) as cnt FROM accounts WHERE account_type IN ('checking', 'savings')`).get() as {
-    cnt: number;
-  };
-  const seq = 100001 + countRow.cnt + Math.floor(Math.random() * 50);
+  const maxRow = db
+    .prepare(
+      `SELECT COALESCE(MAX(CAST(SUBSTR(account_number, 6) AS INTEGER)), 100000) AS max_seq
+       FROM accounts
+       WHERE account_number LIKE 'MTB00%'`,
+    )
+    .get() as { max_seq: number };
+  let seq = maxRow.max_seq + 1;
+  while (db.prepare('SELECT 1 FROM accounts WHERE account_number = ?').get(`MTB00${seq}`)) {
+    seq += 1;
+  }
   return `MTB00${seq}`;
 }
 
@@ -73,7 +80,15 @@ export function createEmployeeRouter(db: Database.Database, config: AppConfig): 
       createdAt: r.created_at,
     }));
 
-    res.json({ customers, maxAdjustmentPaise: config.employeeMaxAdjustmentPaise });
+    const totalUsers = (db.prepare(`SELECT COUNT(*) AS cnt FROM users WHERE role = 'user'`).get() as { cnt: number }).cnt;
+    res.json({
+      customers,
+      maxAdjustmentPaise: config.employeeMaxAdjustmentPaise,
+      limits: {
+        maxUsers: MAX_USER_ACCOUNTS,
+        currentUsers: totalUsers,
+      },
+    });
   });
 
   router.get('/customers/:id', (req, res) => {
@@ -174,6 +189,15 @@ export function createEmployeeRouter(db: Database.Database, config: AppConfig): 
     const cleanMobile = mobile.trim();
     const selectedType = accountType === 'savings' ? 'savings' : 'checking';
 
+    const userCountBefore = (db.prepare(`SELECT COUNT(*) AS cnt FROM users WHERE role = 'user'`).get() as { cnt: number }).cnt;
+    if (userCountBefore >= MAX_USER_ACCOUNTS) {
+      res.status(409).json({
+        error: 'USER_LIMIT_REACHED',
+        message: `Maximum capacity of ${MAX_USER_ACCOUNTS} user IDs reached. Ask a manager to delete an existing user first.`,
+      });
+      return;
+    }
+
     const existing = db
       .prepare('SELECT id FROM users WHERE lower(username) = ? OR lower(email) = ? OR mobile = ?')
       .get(cleanUsername, cleanEmail, cleanMobile);
@@ -209,33 +233,50 @@ export function createEmployeeRouter(db: Database.Database, config: AppConfig): 
     const accountNumber = generateNextAccountNumber(db);
     const upiHandle = `${cleanUsername.replace(/[^a-z0-9]/g, '')}@meridian`;
 
-    db.transaction(() => {
-      db.prepare(`
-        INSERT INTO users (
-          id, username, email, mobile, full_name, password_hash, role, status,
-          must_change_password, sms_opt_in, email_opt_in, kyc_status, kyc_provider_ref, kyc_masked_id,
-          created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'user', 'active', 1, 1, 1, 'verified', ?, ?, ?, ?)
-      `).run(
-        userId,
-        cleanUsername,
-        cleanEmail,
-        cleanMobile,
-        fullName.trim(),
-        hashPassword(temporaryPassword),
-        kycResult.providerRef,
-        kycResult.maskedId,
-        now,
-        now,
-      );
+    try {
+      db.transaction(() => {
+        const currentUsers = (db.prepare(`SELECT COUNT(*) AS cnt FROM users WHERE role = 'user'`).get() as { cnt: number }).cnt;
+        if (currentUsers >= MAX_USER_ACCOUNTS) {
+          const err = new Error(
+            `Maximum capacity of ${MAX_USER_ACCOUNTS} user IDs reached. Ask a manager to delete an existing user first.`,
+          ) as Error & { code?: string };
+          err.code = 'USER_LIMIT_REACHED';
+          throw err;
+        }
 
-      db.prepare(`
-        INSERT INTO accounts (
-          id, account_number, user_id, account_type, currency, upi_handle, status,
-          daily_transfer_limit_paise, per_tx_limit_paise, created_at
-        ) VALUES (?, ?, ?, ?, 'INR', ?, 'active', 10000000, 5000000, ?)
-      `).run(accountId, accountNumber, userId, selectedType, upiHandle, now);
-    })();
+        db.prepare(`
+          INSERT INTO users (
+            id, username, email, mobile, full_name, password_hash, role, status,
+            must_change_password, sms_opt_in, email_opt_in, kyc_status, kyc_provider_ref, kyc_masked_id,
+            created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, 'user', 'active', 1, 1, 1, 'verified', ?, ?, ?, ?)
+        `).run(
+          userId,
+          cleanUsername,
+          cleanEmail,
+          cleanMobile,
+          fullName.trim(),
+          hashPassword(temporaryPassword),
+          kycResult.providerRef,
+          kycResult.maskedId,
+          now,
+          now,
+        );
+
+        db.prepare(`
+          INSERT INTO accounts (
+            id, account_number, user_id, account_type, currency, upi_handle, status,
+            daily_transfer_limit_paise, per_tx_limit_paise, created_at
+          ) VALUES (?, ?, ?, ?, 'INR', ?, 'active', 10000000, 5000000, ?)
+        `).run(accountId, accountNumber, userId, selectedType, upiHandle, now);
+      }).immediate();
+    } catch (err) {
+      if ((err as { code?: string }).code === 'USER_LIMIT_REACHED') {
+        res.status(409).json({ error: 'USER_LIMIT_REACHED', message: (err as Error).message });
+        return;
+      }
+      throw err;
+    }
 
     let openingTx = null;
     const depositAmount = openingDepositPaise ? Math.round(Number(openingDepositPaise)) : 0;
@@ -261,11 +302,14 @@ export function createEmployeeRouter(db: Database.Database, config: AppConfig): 
       }).transaction;
     }
 
-    dispatchTransactionSms(db, config, {
+    await dispatchTransactionNotifications(db, config, {
       userId,
       mobile: cleanMobile,
+      email: cleanEmail,
       smsOptIn: true,
+      emailOptIn: true,
       transactionId: openingTx?.id,
+      subject: `Welcome to Meridian Trust Bank — Account ${accountNumber} Opened`,
       message: `Welcome to Meridian Trust Bank. Account ${accountNumber} opened. Please change your temporary password at first login.`,
     });
 
@@ -305,7 +349,7 @@ export function createEmployeeRouter(db: Database.Database, config: AppConfig): 
     });
   });
 
-  router.post('/adjustments', (req, res) => {
+  router.post('/adjustments', async (req, res) => {
     const { accountId, action, amountPaise, reason, confirmed, idempotencyKey } = (req.body || {}) as {
       accountId?: string;
       action?: 'credit' | 'debit';
@@ -355,7 +399,7 @@ export function createEmployeeRouter(db: Database.Database, config: AppConfig): 
 
     const customerAccount = db
       .prepare(
-        `SELECT a.id, a.account_number, a.user_id, u.full_name, u.mobile, u.sms_opt_in
+        `SELECT a.id, a.account_number, a.user_id, u.full_name, u.mobile, u.email, u.sms_opt_in, u.email_opt_in
          FROM accounts a
          JOIN users u ON u.id = a.user_id
          WHERE a.id = ? AND a.account_type IN ('checking', 'savings')`,
@@ -367,7 +411,9 @@ export function createEmployeeRouter(db: Database.Database, config: AppConfig): 
           user_id: string;
           full_name: string;
           mobile: string | null;
+          email: string | null;
           sms_opt_in: number;
+          email_opt_in: number;
         }
       | undefined;
 
@@ -392,11 +438,14 @@ export function createEmployeeRouter(db: Database.Database, config: AppConfig): 
       });
 
       if (!result.idempotentReplay) {
-        dispatchTransactionSms(db, config, {
+        await dispatchTransactionNotifications(db, config, {
           userId: customerAccount.user_id,
           mobile: customerAccount.mobile,
+          email: customerAccount.email,
           smsOptIn: customerAccount.sms_opt_in === 1,
+          emailOptIn: customerAccount.email_opt_in === 1,
           transactionId: result.transaction.id,
+          subject: `Teller ${action === 'credit' ? 'Credit' : 'Debit'}: INR ${(intAmount / 100).toFixed(2)} (${result.transaction.reference_code})`,
           message: `Account ${customerAccount.account_number} ${action === 'credit' ? 'credited' : 'debited'} INR ${(intAmount / 100).toFixed(2)}. Ref: ${result.transaction.reference_code}.`,
         });
 
@@ -477,6 +526,55 @@ export function createEmployeeRouter(db: Database.Database, config: AppConfig): 
     });
 
     res.json({ ticket: db.prepare('SELECT * FROM help_tickets WHERE id = ?').get(req.params.id) });
+  });
+
+  router.get('/transactions', (req, res) => {
+    const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const status = typeof req.query.status === 'string' ? req.query.status.trim().toLowerCase() : 'all';
+
+    const whereClauses: string[] = [];
+    const params: unknown[] = [];
+
+    if (status && status !== 'all' && ['pending', 'success', 'failed', 'reversed'].includes(status)) {
+      whereClauses.push('lt.status = ?');
+      params.push(status);
+    }
+
+    if (q) {
+      const like = `%${q}%`;
+      whereClauses.push(
+        `(lt.reference_code LIKE ? OR lt.description LIKE ? OR COALESCE(sa.account_number, '') LIKE ? OR COALESCE(da.account_number, '') LIKE ? OR COALESCE(su.full_name, '') LIKE ? OR COALESCE(du.full_name, '') LIKE ? OR COALESCE(lt.external_destination, '') LIKE ?)`,
+      );
+      params.push(like, like, like, like, like, like, like);
+    }
+
+    const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+
+    const transactions = db
+      .prepare(
+        `SELECT lt.id, lt.reference_code, lt.tx_type, lt.status, lt.amount_paise, lt.currency,
+                lt.external_destination, lt.provider_name, lt.provider_tx_ref, lt.description,
+                lt.failure_reason, lt.reversed_transaction_id, lt.created_at, lt.completed_at,
+                sa.account_number AS source_account_number, sa.account_type AS source_account_type,
+                su.full_name AS source_owner_name,
+                da.account_number AS destination_account_number, da.account_type AS destination_account_type,
+                du.full_name AS destination_owner_name,
+                iu.full_name AS initiated_by_name, iu.role AS initiated_by_role
+         FROM ledger_transactions lt
+         LEFT JOIN accounts sa ON sa.id = lt.source_account_id
+         LEFT JOIN users su ON su.id = sa.user_id
+         LEFT JOIN accounts da ON da.id = lt.destination_account_id
+         LEFT JOIN users du ON du.id = da.user_id
+         LEFT JOIN users iu ON iu.id = lt.initiated_by_user_id
+         ${whereSql}
+         ORDER BY lt.created_at DESC
+         LIMIT 200`,
+      )
+      .all(...params);
+
+    const totalRow = db.prepare(`SELECT COUNT(*) AS cnt FROM ledger_transactions lt LEFT JOIN accounts sa ON sa.id = lt.source_account_id LEFT JOIN users su ON su.id = sa.user_id LEFT JOIN accounts da ON da.id = lt.destination_account_id LEFT JOIN users du ON du.id = da.user_id ${whereSql}`).get(...params) as { cnt: number };
+
+    res.json({ transactions, totalCount: totalRow.cnt });
   });
 
   return router;

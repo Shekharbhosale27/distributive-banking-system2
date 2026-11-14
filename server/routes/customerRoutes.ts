@@ -4,7 +4,7 @@ import { AppConfig } from '../config.ts';
 import { SYSTEM_CLEARING_ACCOUNT_ID } from '../db/database.ts';
 import { createRateLimiter, requireAuth, requireRole } from '../middleware/security.ts';
 import { resolveMobileViaProvider, submitBankTransferToProvider, submitUpiPaymentToProvider } from '../providers/paymentProvider.ts';
-import { dispatchTransactionSms } from '../providers/smsProvider.ts';
+import { dispatchTransactionEmail, dispatchTransactionNotifications } from '../providers/emailProvider.ts';
 import { generateId, maskAccountNumber, randomToken } from '../security/crypto.ts';
 import { recordAuditLog } from '../services/auditService.ts';
 import {
@@ -287,18 +287,19 @@ export function createCustomerRouter(db: Database.Database, config: AppConfig): 
     });
   });
 
-  router.post('/transfers/internal', requireRole(db, 'user'), transferLimiter, (req, res) => {
+  router.post('/transfers/internal', requireRole(db, 'user'), transferLimiter, async (req, res) => {
     const secretViolation = rejectSecretFields(req.body);
     if (secretViolation) {
       res.status(400).json({ error: 'FORBIDDEN_FIELD', message: secretViolation });
       return;
     }
 
-    const { destinationAccountNumber, amountPaise, description, idempotencyKey } = (req.body || {}) as {
+    const { destinationAccountNumber, amountPaise, description, idempotencyKey, sendGmailReceipt } = (req.body || {}) as {
       destinationAccountNumber?: string;
       amountPaise?: number;
       description?: string;
       idempotencyKey?: string;
+      sendGmailReceipt?: boolean;
     };
 
     if (!destinationAccountNumber || !amountPaise || !idempotencyKey) {
@@ -317,7 +318,8 @@ export function createCustomerRouter(db: Database.Database, config: AppConfig): 
 
     const dstAccount = db
       .prepare(
-        `SELECT a.*, u.full_name, u.id AS owner_id, u.mobile AS owner_mobile, u.sms_opt_in AS owner_sms_opt_in
+        `SELECT a.*, u.full_name, u.id AS owner_id, u.mobile AS owner_mobile, u.email AS owner_email,
+                u.sms_opt_in AS owner_sms_opt_in, u.email_opt_in AS owner_email_opt_in
          FROM accounts a
          JOIN users u ON u.id = a.user_id
          WHERE a.account_number = ? AND u.status = 'active' AND a.status = 'active'`,
@@ -329,7 +331,9 @@ export function createCustomerRouter(db: Database.Database, config: AppConfig): 
           full_name: string;
           owner_id: string;
           owner_mobile: string | null;
+          owner_email: string | null;
           owner_sms_opt_in: number;
+          owner_email_opt_in: number;
         }
       | undefined;
 
@@ -337,6 +341,11 @@ export function createCustomerRouter(db: Database.Database, config: AppConfig): 
       res.status(404).json({ error: 'RECIPIENT_NOT_FOUND', message: 'Active destination account not found.' });
       return;
     }
+
+    const gmailToken =
+      sendGmailReceipt === true && typeof req.headers['x-gmail-access-token'] === 'string'
+        ? req.headers['x-gmail-access-token'].trim()
+        : undefined;
 
     try {
       const result = postDoubleEntryTransaction(db, {
@@ -353,20 +362,32 @@ export function createCustomerRouter(db: Database.Database, config: AppConfig): 
       });
 
       if (!result.idempotentReplay) {
-        dispatchTransactionSms(db, config, {
-          userId: req.authUser!.id,
-          mobile: req.authUser!.mobile,
-          smsOptIn: req.authUser!.smsOptIn,
-          transactionId: result.transaction.id,
-          message: `INR ${(result.transaction.amount_paise / 100).toFixed(2)} sent to ${dstAccount.full_name} (${maskAccountNumber(dstAccount.account_number)}). Ref: ${result.transaction.reference_code}.`,
-        });
-        dispatchTransactionSms(db, config, {
-          userId: dstAccount.owner_id,
-          mobile: dstAccount.owner_mobile,
-          smsOptIn: dstAccount.owner_sms_opt_in === 1,
-          transactionId: result.transaction.id,
-          message: `INR ${(result.transaction.amount_paise / 100).toFixed(2)} credited from ${req.authUser!.fullName}. Ref: ${result.transaction.reference_code}.`,
-        });
+        const senderMsg = `INR ${(result.transaction.amount_paise / 100).toFixed(2)} sent to ${dstAccount.full_name} (${maskAccountNumber(dstAccount.account_number)}). Ref: ${result.transaction.reference_code}.`;
+        const recipientMsg = `INR ${(result.transaction.amount_paise / 100).toFixed(2)} credited from ${req.authUser!.fullName}. Ref: ${result.transaction.reference_code}.`;
+
+        await Promise.all([
+          dispatchTransactionNotifications(db, config, {
+            userId: req.authUser!.id,
+            mobile: req.authUser!.mobile,
+            email: req.authUser!.email,
+            smsOptIn: req.authUser!.smsOptIn,
+            emailOptIn: req.authUser!.emailOptIn,
+            transactionId: result.transaction.id,
+            subject: `Debit Alert: INR ${(result.transaction.amount_paise / 100).toFixed(2)} Sent (${result.transaction.reference_code})`,
+            message: senderMsg,
+            gmailAccessToken: gmailToken,
+          }),
+          dispatchTransactionNotifications(db, config, {
+            userId: dstAccount.owner_id,
+            mobile: dstAccount.owner_mobile,
+            email: dstAccount.owner_email,
+            smsOptIn: dstAccount.owner_sms_opt_in === 1,
+            emailOptIn: dstAccount.owner_email_opt_in === 1,
+            transactionId: result.transaction.id,
+            subject: `Credit Alert: INR ${(result.transaction.amount_paise / 100).toFixed(2)} Received (${result.transaction.reference_code})`,
+            message: recipientMsg,
+          }),
+        ]);
         recordAuditLog(db, {
           actorUserId: req.authUser!.id,
           actorRole: 'user',
@@ -414,12 +435,13 @@ export function createCustomerRouter(db: Database.Database, config: AppConfig): 
       return;
     }
 
-    const { upiHandle, mobile, amountPaise, description, idempotencyKey } = (req.body || {}) as {
+    const { upiHandle, mobile, amountPaise, description, idempotencyKey, sendGmailReceipt } = (req.body || {}) as {
       upiHandle?: string;
       mobile?: string;
       amountPaise?: number;
       description?: string;
       idempotencyKey?: string;
+      sendGmailReceipt?: boolean;
     };
 
     if (!amountPaise || !idempotencyKey || (!upiHandle && !mobile)) {
@@ -429,6 +451,11 @@ export function createCustomerRouter(db: Database.Database, config: AppConfig): 
       });
       return;
     }
+
+    const gmailToken =
+      sendGmailReceipt === true && typeof req.headers['x-gmail-access-token'] === 'string'
+        ? req.headers['x-gmail-access-token'].trim()
+        : undefined;
 
     const srcAccount = getPrimaryCustomerAccount(db, req.authUser!.id);
     if (!srcAccount) {
@@ -461,11 +488,39 @@ export function createCustomerRouter(db: Database.Database, config: AppConfig): 
 
     // Check if target UPI handle belongs to an internal Meridian account
     const internalAcct = resolvedInternalId
-      ? (db.prepare('SELECT id, user_id, account_number FROM accounts WHERE id = ? AND status = ?').get(resolvedInternalId, 'active') as
-          | { id: string; user_id: string; account_number: string }
+      ? (db
+          .prepare(
+            `SELECT a.id, a.user_id, a.account_number, u.mobile AS owner_mobile, u.email AS owner_email, u.sms_opt_in, u.email_opt_in
+             FROM accounts a JOIN users u ON u.id = a.user_id
+             WHERE a.id = ? AND a.status = 'active'`,
+          )
+          .get(resolvedInternalId) as
+          | {
+              id: string;
+              user_id: string;
+              account_number: string;
+              owner_mobile: string | null;
+              owner_email: string | null;
+              sms_opt_in: number;
+              email_opt_in: number;
+            }
           | undefined)
-      : (db.prepare('SELECT id, user_id, account_number FROM accounts WHERE lower(upi_handle) = ? AND status = ?').get(targetVpa, 'active') as
-          | { id: string; user_id: string; account_number: string }
+      : (db
+          .prepare(
+            `SELECT a.id, a.user_id, a.account_number, u.mobile AS owner_mobile, u.email AS owner_email, u.sms_opt_in, u.email_opt_in
+             FROM accounts a JOIN users u ON u.id = a.user_id
+             WHERE lower(a.upi_handle) = ? AND a.status = 'active'`,
+          )
+          .get(targetVpa) as
+          | {
+              id: string;
+              user_id: string;
+              account_number: string;
+              owner_mobile: string | null;
+              owner_email: string | null;
+              sms_opt_in: number;
+              email_opt_in: number;
+            }
           | undefined);
 
     if (internalAcct) {
@@ -485,13 +540,30 @@ export function createCustomerRouter(db: Database.Database, config: AppConfig): 
         });
 
         if (!result.idempotentReplay) {
-          dispatchTransactionSms(db, config, {
-            userId: req.authUser!.id,
-            mobile: req.authUser!.mobile,
-            smsOptIn: req.authUser!.smsOptIn,
-            transactionId: result.transaction.id,
-            message: `INR ${(result.transaction.amount_paise / 100).toFixed(2)} paid via UPI to ${targetVpa}. Ref: ${result.transaction.reference_code}.`,
-          });
+          const amtText = (result.transaction.amount_paise / 100).toFixed(2);
+          await Promise.all([
+            dispatchTransactionNotifications(db, config, {
+              userId: req.authUser!.id,
+              mobile: req.authUser!.mobile,
+              email: req.authUser!.email,
+              smsOptIn: req.authUser!.smsOptIn,
+              emailOptIn: req.authUser!.emailOptIn,
+              transactionId: result.transaction.id,
+              subject: `UPI Debit Alert: INR ${amtText} to ${targetVpa} (${result.transaction.reference_code})`,
+              message: `INR ${amtText} paid via UPI to ${targetVpa}. Ref: ${result.transaction.reference_code}.`,
+              gmailAccessToken: gmailToken,
+            }),
+            dispatchTransactionNotifications(db, config, {
+              userId: internalAcct.user_id,
+              mobile: internalAcct.owner_mobile,
+              email: internalAcct.owner_email,
+              smsOptIn: internalAcct.sms_opt_in === 1,
+              emailOptIn: internalAcct.email_opt_in === 1,
+              transactionId: result.transaction.id,
+              subject: `UPI Credit Alert: INR ${amtText} Received (${result.transaction.reference_code})`,
+              message: `INR ${amtText} credited via UPI from ${req.authUser!.fullName}. Ref: ${result.transaction.reference_code}.`,
+            }),
+          ]);
         }
 
         res.status(result.idempotentReplay ? 200 : 201).json({
@@ -573,12 +645,16 @@ export function createCustomerRouter(db: Database.Database, config: AppConfig): 
       ).original;
     }
 
-    dispatchTransactionSms(db, config, {
+    await dispatchTransactionNotifications(db, config, {
       userId: req.authUser!.id,
       mobile: req.authUser!.mobile,
+      email: req.authUser!.email,
       smsOptIn: req.authUser!.smsOptIn,
+      emailOptIn: req.authUser!.emailOptIn,
       transactionId: finalTx.id,
+      subject: `UPI Transfer ${finalTx.status.toUpperCase()}: INR ${(finalTx.amount_paise / 100).toFixed(2)} (${finalTx.reference_code})`,
       message: `UPI transfer ${finalTx.reference_code} to ${targetVpa} for INR ${(finalTx.amount_paise / 100).toFixed(2)} status: ${finalTx.status.toUpperCase()}.`,
+      gmailAccessToken: gmailToken,
     });
 
     res.status(201).json({
@@ -596,7 +672,7 @@ export function createCustomerRouter(db: Database.Database, config: AppConfig): 
       return;
     }
 
-    const { beneficiaryName, accountNumber, ifscCode, rail, amountPaise, description, idempotencyKey } = (req.body || {}) as {
+    const { beneficiaryName, accountNumber, ifscCode, rail, amountPaise, description, idempotencyKey, sendGmailReceipt } = (req.body || {}) as {
       beneficiaryName?: string;
       accountNumber?: string;
       ifscCode?: string;
@@ -604,6 +680,7 @@ export function createCustomerRouter(db: Database.Database, config: AppConfig): 
       amountPaise?: number;
       description?: string;
       idempotencyKey?: string;
+      sendGmailReceipt?: boolean;
     };
 
     if (!beneficiaryName || !accountNumber || !ifscCode || !amountPaise || !idempotencyKey) {
@@ -618,6 +695,11 @@ export function createCustomerRouter(db: Database.Database, config: AppConfig): 
       res.status(400).json({ error: 'INVALID_IFSC', message: 'IFSC code must match standard 11-character format (e.g. HDFC0001234).' });
       return;
     }
+
+    const gmailToken =
+      sendGmailReceipt === true && typeof req.headers['x-gmail-access-token'] === 'string'
+        ? req.headers['x-gmail-access-token'].trim()
+        : undefined;
 
     const selectedRail: 'IMPS' | 'NEFT' | 'RTGS' = rail && ['IMPS', 'NEFT', 'RTGS'].includes(rail) ? rail : 'NEFT';
     const srcAccount = getPrimaryCustomerAccount(db, req.authUser!.id);
@@ -694,12 +776,16 @@ export function createCustomerRouter(db: Database.Database, config: AppConfig): 
       finalTx = db.prepare('SELECT * FROM ledger_transactions WHERE id = ?').get(held.transaction.id) as typeof finalTx;
     }
 
-    dispatchTransactionSms(db, config, {
+    await dispatchTransactionNotifications(db, config, {
       userId: req.authUser!.id,
       mobile: req.authUser!.mobile,
+      email: req.authUser!.email,
       smsOptIn: req.authUser!.smsOptIn,
+      emailOptIn: req.authUser!.emailOptIn,
       transactionId: finalTx.id,
+      subject: `${selectedRail} Transfer ${finalTx.status.toUpperCase()}: INR ${(finalTx.amount_paise / 100).toFixed(2)} (${finalTx.reference_code})`,
       message: `${selectedRail} transfer ${finalTx.reference_code} for INR ${(finalTx.amount_paise / 100).toFixed(2)} is ${finalTx.status.toUpperCase()}.`,
+      gmailAccessToken: gmailToken,
     });
 
     res.status(201).json({
@@ -761,7 +847,7 @@ export function createCustomerRouter(db: Database.Database, config: AppConfig): 
     });
   });
 
-  router.post('/qr/pay', requireRole(db, 'user'), transferLimiter, (req, res) => {
+  router.post('/qr/pay', requireRole(db, 'user'), transferLimiter, async (req, res) => {
     const { payload, amountPaise, confirmed, idempotencyKey } = (req.body || {}) as {
       payload?: string;
       amountPaise?: number;
@@ -831,13 +917,45 @@ export function createCustomerRouter(db: Database.Database, config: AppConfig): 
       }
 
       if (!result.idempotentReplay) {
-        dispatchTransactionSms(db, config, {
-          userId: req.authUser!.id,
-          mobile: req.authUser!.mobile,
-          smsOptIn: req.authUser!.smsOptIn,
-          transactionId: result.transaction.id,
-          message: `QR payment of INR ${(finalAmountPaise / 100).toFixed(2)} to ${inspected.recipientName} succeeded. Ref: ${result.transaction.reference_code}.`,
-        });
+        const amtText = (finalAmountPaise / 100).toFixed(2);
+        const merchantOwner = db
+          .prepare(
+            `SELECT u.id, u.mobile, u.email, u.sms_opt_in, u.email_opt_in
+             FROM accounts a JOIN users u ON u.id = a.user_id
+             WHERE a.id = ?`,
+          )
+          .get(inspected.merchantAccountId) as
+          | { id: string; mobile: string | null; email: string | null; sms_opt_in: number; email_opt_in: number }
+          | undefined;
+
+        const jobs: Array<Promise<unknown>> = [
+          dispatchTransactionNotifications(db, config, {
+            userId: req.authUser!.id,
+            mobile: req.authUser!.mobile,
+            email: req.authUser!.email,
+            smsOptIn: req.authUser!.smsOptIn,
+            emailOptIn: req.authUser!.emailOptIn,
+            transactionId: result.transaction.id,
+            subject: `QR Payment Sent: INR ${amtText} to ${inspected.recipientName} (${result.transaction.reference_code})`,
+            message: `QR payment of INR ${amtText} to ${inspected.recipientName} succeeded. Ref: ${result.transaction.reference_code}.`,
+          }),
+        ];
+
+        if (merchantOwner) {
+          jobs.push(
+            dispatchTransactionNotifications(db, config, {
+              userId: merchantOwner.id,
+              mobile: merchantOwner.mobile,
+              email: merchantOwner.email,
+              smsOptIn: merchantOwner.sms_opt_in === 1,
+              emailOptIn: merchantOwner.email_opt_in === 1,
+              transactionId: result.transaction.id,
+              subject: `QR Payment Received: INR ${amtText} (${result.transaction.reference_code})`,
+              message: `INR ${amtText} received via QR from ${req.authUser!.fullName}. Ref: ${result.transaction.reference_code}.`,
+            }),
+          );
+        }
+        await Promise.all(jobs);
       }
 
       res.status(result.idempotentReplay ? 200 : 201).json({
@@ -859,6 +977,105 @@ export function createCustomerRouter(db: Database.Database, config: AppConfig): 
       .prepare('SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 50')
       .all(req.authUser!.id);
     res.json({ notifications: rows });
+  });
+
+  router.post('/notifications/send-gmail', requireRole(db, 'user', 'employee', 'manager'), async (req, res) => {
+    const gmailTokenHeader = req.headers['x-gmail-access-token'];
+    const gmailAccessToken = typeof gmailTokenHeader === 'string' ? gmailTokenHeader.replace(/^Bearer\s+/i, '').trim() : '';
+
+    if (!gmailAccessToken) {
+      res.status(401).json({
+        error: 'GMAIL_AUTH_REQUIRED',
+        message: 'Sign in with Google and grant Gmail permission before sending via Gmail API.',
+      });
+      return;
+    }
+
+    const { transactionId, recipientEmail, confirmed } = (req.body || {}) as {
+      transactionId?: string;
+      recipientEmail?: string;
+      confirmed?: boolean;
+    };
+
+    if (confirmed !== true) {
+      res.status(400).json({
+        error: 'CONFIRMATION_REQUIRED',
+        message: 'Explicit user confirmation is required before sending an email via Gmail.',
+      });
+      return;
+    }
+
+    const targetEmail = (recipientEmail || req.authUser!.email || '').trim();
+    if (!targetEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(targetEmail)) {
+      res.status(400).json({ error: 'INVALID_EMAIL', message: 'A valid recipient email address is required.' });
+      return;
+    }
+
+    let subject = 'Meridian Trust Bank — Transaction Alert Test';
+    let message = `Hello ${req.authUser!.fullName},\n\nThis is a verified Gmail transaction alert check from Meridian Trust Bank.`;
+    let linkedTxId: string | undefined;
+
+    if (transactionId) {
+      const tx = db
+        .prepare(
+          `SELECT lt.*,
+                  sa.account_number AS source_account_number, sa.user_id AS source_user_id,
+                  da.account_number AS destination_account_number, da.user_id AS destination_user_id
+           FROM ledger_transactions lt
+           LEFT JOIN accounts sa ON sa.id = lt.source_account_id
+           LEFT JOIN accounts da ON da.id = lt.destination_account_id
+           WHERE lt.id = ? OR lt.reference_code = ?`,
+        )
+        .get(transactionId, transactionId) as Record<string, unknown> | undefined;
+
+      if (!tx) {
+        res.status(404).json({ error: 'TRANSACTION_NOT_FOUND', message: 'Transaction not found.' });
+        return;
+      }
+
+      if (
+        req.authUser!.role === 'user' &&
+        tx.source_user_id !== req.authUser!.id &&
+        tx.destination_user_id !== req.authUser!.id
+      ) {
+        res.status(403).json({ error: 'FORBIDDEN', message: 'You are not authorized to email this transaction receipt.' });
+        return;
+      }
+
+      linkedTxId = tx.id as string;
+      const amtInr = ((tx.amount_paise as number) / 100).toFixed(2);
+      subject = `Meridian Trust Bank Receipt: ${tx.reference_code} (INR ${amtInr})`;
+      message = [
+        `Meridian Trust Bank — Official Transaction Receipt`,
+        `Reference: ${tx.reference_code}`,
+        `Type: ${String(tx.tx_type).replace(/_/g, ' ').toUpperCase()}`,
+        `Status: ${String(tx.status).toUpperCase()}`,
+        `Amount: INR ${amtInr}`,
+        `Description: ${tx.description}`,
+        `Date: ${tx.created_at}`,
+      ].join('\n');
+    }
+
+    const emailResult = await dispatchTransactionEmail(db, config, {
+      userId: req.authUser!.id,
+      email: targetEmail,
+      emailOptIn: true,
+      transactionId: linkedTxId,
+      subject,
+      message,
+      gmailAccessToken,
+    });
+
+    if (emailResult.status === 'failed') {
+      res.status(502).json({
+        error: 'GMAIL_SEND_FAILED',
+        message: emailResult.errorMessage || 'Unable to send email through Gmail API.',
+        notification: emailResult,
+      });
+      return;
+    }
+
+    res.status(200).json({ ok: true, notification: emailResult });
   });
 
   router.get('/help/tickets', requireRole(db, 'user'), (req, res) => {

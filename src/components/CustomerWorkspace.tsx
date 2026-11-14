@@ -10,11 +10,13 @@ import {
   HelpCircle,
   LayoutDashboard,
   LogOut,
+  Mail,
   QrCode,
   Receipt,
   Send,
   ShieldCheck,
 } from 'lucide-react';
+import type { User as FirebaseUser } from 'firebase/auth';
 import {
   ApiError,
   apiFetch,
@@ -23,6 +25,13 @@ import {
   formatInr,
   type AuthUser,
 } from '../lib/api';
+import {
+  getGoogleAccessToken,
+  googleSignIn,
+  googleSignOut,
+  initGoogleAuth,
+} from '../lib/googleAuth';
+import { GoogleSignInButton } from './GoogleSignInButton';
 import { QrScannerPanel } from './QrScannerPanel';
 import { EmptyState, TableSkeleton, TxStatusText } from './StatusIndicator';
 
@@ -91,6 +100,7 @@ interface NotificationItem {
   recipient_masked: string;
   message: string;
   provider: string;
+  provider_message_id: string | null;
   status: string;
   error_message: string | null;
   created_at: string;
@@ -153,14 +163,43 @@ export function CustomerWorkspace({ user, onLogout }: { user: AuthUser; onLogout
   } | null>(null);
   const [copiedPayload, setCopiedPayload] = useState(false);
 
-  // Notifications & Help state
+  // Notifications, Google Workspace Gmail & Help state
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
+  const [googleUser, setGoogleUser] = useState<FirebaseUser | null>(null);
+  const [googleToken, setGoogleToken] = useState<string | null>(() => getGoogleAccessToken());
+  const [needsGoogleAuth, setNeedsGoogleAuth] = useState(() => !getGoogleAccessToken());
+  const [googleAuthBusy, setGoogleAuthBusy] = useState(false);
+  const [sendGmailWithTransfer, setSendGmailWithTransfer] = useState(true);
+  const [gmailConfirmModal, setGmailConfirmModal] = useState<{
+    transactionId?: string;
+    referenceCode?: string;
+    recipientEmail: string;
+    subjectPreview: string;
+  } | null>(null);
+  const [gmailSendBusy, setGmailSendBusy] = useState(false);
+  const [gmailFeedback, setGmailFeedback] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
   const [tickets, setTickets] = useState<HelpTicket[]>([]);
   const [helpCategory, setHelpCategory] = useState('Transfer Inquiry');
   const [helpSubject, setHelpSubject] = useState('');
   const [helpMessage, setHelpMessage] = useState('');
   const [helpTxRef, setHelpTxRef] = useState('');
   const [helpStatusMsg, setHelpStatusMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    const unsub = initGoogleAuth(
+      (gUser, token) => {
+        setGoogleUser(gUser);
+        setGoogleToken(token);
+        setNeedsGoogleAuth(false);
+      },
+      () => {
+        setGoogleUser(null);
+        setGoogleToken(null);
+        setNeedsGoogleAuth(true);
+      },
+    );
+    return () => unsub();
+  }, []);
 
   const loadWorkspace = useCallback(async () => {
     setLoading(true);
@@ -262,11 +301,17 @@ export function CustomerWorkspace({ user, onLogout }: { user: AuthUser; onLogout
         };
       }
 
+      const activeGmailToken = sendGmailWithTransfer ? getGoogleAccessToken() : null;
+      if (activeGmailToken) {
+        body.sendGmailReceipt = true;
+      }
+
       const res = await apiFetch<{
         transaction: { reference_code: string; status: string };
         providerNote?: string;
       }>(endpoint, {
         method: 'POST',
+        headers: activeGmailToken ? { 'X-Gmail-Access-Token': activeGmailToken } : undefined,
         body: JSON.stringify(body),
       });
 
@@ -306,6 +351,79 @@ export function CustomerWorkspace({ user, onLogout }: { user: AuthUser; onLogout
     });
     setSmsOptIn(res.smsOptIn);
     setEmailOptIn(res.emailOptIn);
+  }
+
+  async function handleConnectGoogle() {
+    setGoogleAuthBusy(true);
+    setGmailFeedback(null);
+    try {
+      const result = await googleSignIn();
+      setGoogleUser(result.user);
+      setGoogleToken(result.accessToken);
+      setNeedsGoogleAuth(false);
+      setGmailFeedback({
+        kind: 'ok',
+        text: `Connected Google account (${result.user.email || 'Gmail'}) for transaction receipt delivery.`,
+      });
+    } catch (err) {
+      setGmailFeedback({
+        kind: 'err',
+        text: err instanceof Error ? err.message : 'Unable to connect Google account.',
+      });
+    } finally {
+      setGoogleAuthBusy(false);
+    }
+  }
+
+  async function handleDisconnectGoogle() {
+    await googleSignOut();
+    setGoogleUser(null);
+    setGoogleToken(null);
+    setNeedsGoogleAuth(true);
+    setGmailFeedback(null);
+  }
+
+  async function handleConfirmedGmailSend() {
+    if (!gmailConfirmModal) return;
+    const token = getGoogleAccessToken() || googleToken;
+    if (!token) {
+      setGmailConfirmModal(null);
+      setNeedsGoogleAuth(true);
+      setGmailFeedback({ kind: 'err', text: 'Sign in with Google first to send emails via Gmail.' });
+      return;
+    }
+    setGmailSendBusy(true);
+    setGmailFeedback(null);
+    try {
+      const res = await apiFetch<{ ok: boolean; notification: { providerMessageId?: string | null } }>(
+        '/api/notifications/send-gmail',
+        {
+          method: 'POST',
+          headers: { 'X-Gmail-Access-Token': token },
+          body: JSON.stringify({
+            transactionId: gmailConfirmModal.transactionId,
+            recipientEmail: gmailConfirmModal.recipientEmail,
+            confirmed: true,
+          }),
+        },
+      );
+      setGmailFeedback({
+        kind: 'ok',
+        text: `Email delivered to ${gmailConfirmModal.recipientEmail} via Gmail API${
+          res.notification.providerMessageId ? ` (Message ID: ${res.notification.providerMessageId})` : ''
+        }.`,
+      });
+      setGmailConfirmModal(null);
+      await loadWorkspace();
+    } catch (err) {
+      setGmailConfirmModal(null);
+      setGmailFeedback({
+        kind: 'err',
+        text: err instanceof ApiError ? err.message : 'Unable to send email through Gmail API.',
+      });
+    } finally {
+      setGmailSendBusy(false);
+    }
   }
 
   async function handleSubmitHelp(e: FormEvent) {
@@ -971,14 +1089,14 @@ export function CustomerWorkspace({ user, onLogout }: { user: AuthUser; onLogout
 
               {tab === 'notifications' && (
                 <div className="space-y-6">
-                  <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-4">
+                  <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-5">
                     <div>
-                      <h2 className="text-lg font-bold text-slate-900">SMS &amp; Alert Consent Preferences</h2>
+                      <h2 className="text-lg font-bold text-slate-900">Mobile SMS &amp; Gmail Transaction Alerts</h2>
                       <p className="text-xs text-slate-500 mt-0.5">
-                        Transaction alerts are sent to your registered mobile ({user.mobile}) via our configurable SMS adapter. Delivery failures never alter settled ledger entries.
+                        Transaction alerts dispatch automatically to your registered mobile ({user.mobile || 'not set'}) and email ({user.email || 'not set'}). Notification delivery failures never alter settled ledger balances.
                       </p>
                     </div>
-                    <div className="flex flex-wrap gap-6 pt-2">
+                    <div className="flex flex-wrap gap-6 pt-1">
                       <label className="inline-flex items-center gap-2.5 text-sm text-slate-800 cursor-pointer">
                         <input
                           type="checkbox"
@@ -995,15 +1113,71 @@ export function CustomerWorkspace({ user, onLogout }: { user: AuthUser; onLogout
                           onChange={(e) => void handleTogglePreferences(smsOptIn, e.target.checked)}
                           className="w-4 h-4 accent-emerald-700"
                         />
-                        <span>Receive Email Statements &amp; Security Notices</span>
+                        <span>Receive Gmail / Email Transaction Alerts</span>
                       </label>
                     </div>
+
+                    <div className="border-t border-slate-200 pt-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                      <div>
+                        <p className="text-sm font-semibold text-slate-900">Direct Gmail Receipt Delivery</p>
+                        <p className="text-xs text-slate-500 mt-0.5">
+                          {needsGoogleAuth || !googleToken
+                            ? 'Connect your Google account to send transaction receipts directly via Gmail with your confirmation.'
+                            : `Connected as ${googleUser?.email || user.email || 'Google Account'}`}
+                        </p>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+                        {needsGoogleAuth || !googleToken ? (
+                          <GoogleSignInButton
+                            onClick={() => void handleConnectGoogle()}
+                            disabled={googleAuthBusy}
+                            label={googleAuthBusy ? 'Connecting...' : 'Sign in with Google'}
+                          />
+                        ) : (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setGmailConfirmModal({
+                                  recipientEmail: user.email || googleUser?.email || '',
+                                  subjectPreview: 'Meridian Trust Bank — Transaction Alert Test',
+                                })
+                              }
+                              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-white bg-emerald-700 rounded-lg hover:bg-emerald-800 whitespace-nowrap"
+                            >
+                              <Mail className="w-3.5 h-3.5" />
+                              Send Test Gmail Alert
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => void handleDisconnectGoogle()}
+                              className="px-3 py-2 text-xs font-medium text-slate-700 border border-slate-300 rounded-lg hover:bg-slate-50 whitespace-nowrap"
+                            >
+                              Disconnect Google
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+
+                    {gmailFeedback && (
+                      <div
+                        role={gmailFeedback.kind === 'err' ? 'alert' : 'status'}
+                        className={`p-3 rounded-lg border text-xs ${
+                          gmailFeedback.kind === 'ok'
+                            ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                            : 'bg-red-50 border-red-200 text-red-800'
+                        }`}
+                      >
+                        {gmailFeedback.text}
+                      </div>
+                    )}
                   </div>
 
                   <div className="bg-white border border-slate-200 rounded-xl p-6">
-                    <h3 className="text-base font-bold text-slate-900 mb-4">Notification Dispatch Log</h3>
+                    <h3 className="text-base font-bold text-slate-900 mb-4">SMS &amp; Email Dispatch Log</h3>
                     {notifications.length === 0 ? (
-                      <EmptyState title="No alerts yet" description="SMS and security alerts will appear here when transactions occur." />
+                      <EmptyState title="No alerts yet" description="SMS and Gmail alerts will appear here when transactions occur." />
                     ) : (
                       <div className="divide-y divide-slate-100">
                         {notifications.map((n) => (
@@ -1011,11 +1185,22 @@ export function CustomerWorkspace({ user, onLogout }: { user: AuthUser; onLogout
                             <div>
                               <p className="text-sm text-slate-900">{n.message}</p>
                               <p className="text-xs text-slate-500 mt-0.5">
-                                {n.channel.toUpperCase()} · {n.recipient_masked} · {n.provider} · {formatDateTime(n.created_at)}
+                                {n.channel.toUpperCase()} · {n.recipient_masked} · {n.provider}
+                                {n.provider_message_id ? ` · ${n.provider_message_id}` : ''} · {formatDateTime(n.created_at)}
                               </p>
                               {n.error_message && <p className="text-xs text-red-700 mt-0.5">{n.error_message}</p>}
                             </div>
-                            <span className="text-xs font-mono text-slate-600 whitespace-nowrap">{n.status}</span>
+                            <span
+                              className={`text-xs font-mono whitespace-nowrap ${
+                                n.status === 'sent'
+                                  ? 'text-emerald-700 font-semibold'
+                                  : n.status === 'failed'
+                                    ? 'text-red-700'
+                                    : 'text-slate-600'
+                              }`}
+                            >
+                              {n.status}
+                            </span>
                           </div>
                         ))}
                       </div>
@@ -1152,6 +1337,19 @@ export function CustomerWorkspace({ user, onLogout }: { user: AuthUser; onLogout
                 </span>
               </div>
             </div>
+            {googleToken && user.email && (
+              <label className="flex items-start gap-2.5 text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-lg p-2.5 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={sendGmailWithTransfer}
+                  onChange={(e) => setSendGmailWithTransfer(e.target.checked)}
+                  className="w-4 h-4 mt-0.5 accent-emerald-700"
+                />
+                <span>
+                  Also send confirmation email to <span className="font-mono">{user.email}</span> via connected Gmail ({googleUser?.email || 'Google'})
+                </span>
+              </label>
+            )}
             <div className="flex items-center gap-3">
               <button
                 type="button"
@@ -1237,13 +1435,81 @@ export function CustomerWorkspace({ user, onLogout }: { user: AuthUser; onLogout
               )}
             </div>
 
-            <div className="flex justify-end">
+            <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+              {googleToken ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const targetEmail = user.email || googleUser?.email || '';
+                    if (!targetEmail) return;
+                    setGmailConfirmModal({
+                      transactionId: receipt.transaction.id,
+                      referenceCode: receipt.transaction.referenceCode,
+                      recipientEmail: targetEmail,
+                      subjectPreview: `Meridian Trust Bank Receipt: ${receipt.transaction.referenceCode}`,
+                    });
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-white bg-emerald-700 rounded-lg hover:bg-emerald-800 whitespace-nowrap"
+                >
+                  <Mail className="w-3.5 h-3.5" />
+                  Email Receipt via Gmail
+                </button>
+              ) : (
+                <GoogleSignInButton
+                  onClick={() => void handleConnectGoogle()}
+                  disabled={googleAuthBusy}
+                  label={googleAuthBusy ? 'Connecting...' : 'Sign in with Google to Email Receipt'}
+                />
+              )}
               <button
                 type="button"
                 onClick={() => setReceipt(null)}
                 className="px-4 py-2 text-xs font-medium text-slate-700 border border-slate-300 rounded-lg hover:bg-slate-50"
               >
                 Close Receipt
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Explicit Confirmation Modal for Sending Email via Gmail API */}
+      {gmailConfirmModal && (
+        <div className="fixed inset-0 z-[60] bg-slate-900/60 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-xl p-6 max-w-md w-full space-y-4">
+            <div className="flex items-center gap-2 text-emerald-700">
+              <Mail className="w-5 h-5" />
+              <h3 className="text-base font-bold text-slate-900">Confirm Sending Email via Gmail</h3>
+            </div>
+            <p className="text-xs text-slate-600 leading-relaxed">
+              This will send a message from your connected Google account (<span className="font-mono">{googleUser?.email || 'Gmail'}</span>) through the Gmail API.
+            </p>
+            <div className="border-y border-slate-200 py-3 space-y-2 text-xs">
+              <div className="flex justify-between gap-4">
+                <span className="text-slate-500">Recipient</span>
+                <span className="font-mono text-slate-900">{gmailConfirmModal.recipientEmail}</span>
+              </div>
+              <div className="flex justify-between gap-4">
+                <span className="text-slate-500">Subject</span>
+                <span className="text-slate-900 text-right">{gmailConfirmModal.subjectPreview}</span>
+              </div>
+            </div>
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                disabled={gmailSendBusy}
+                onClick={() => void handleConfirmedGmailSend()}
+                className="flex-1 py-2.5 px-4 text-xs font-medium text-white bg-emerald-700 rounded-lg hover:bg-emerald-800 disabled:opacity-60"
+              >
+                {gmailSendBusy ? 'Sending Email...' : 'Confirm & Send Email'}
+              </button>
+              <button
+                type="button"
+                disabled={gmailSendBusy}
+                onClick={() => setGmailConfirmModal(null)}
+                className="py-2.5 px-4 text-xs font-medium text-slate-700 border border-slate-300 rounded-lg hover:bg-slate-50"
+              >
+                Cancel
               </button>
             </div>
           </div>

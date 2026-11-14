@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import {
+  ArrowLeftRight,
+  Bell,
   CheckCircle2,
   HelpCircle,
   LogOut,
@@ -18,7 +20,7 @@ import {
 } from '../lib/api';
 import { EmptyState, TableSkeleton, TxStatusText } from './StatusIndicator';
 
-type EmployeeTab = 'customers' | 'onboard' | 'tickets';
+type EmployeeTab = 'customers' | 'transactions' | 'onboard' | 'tickets' | 'notifications';
 
 interface CustomerRow {
   userId: string;
@@ -50,6 +52,24 @@ interface CustomerTx {
   created_at: string;
 }
 
+interface BankTxRow {
+  id: string;
+  reference_code: string;
+  tx_type: string;
+  status: 'pending' | 'success' | 'failed' | 'reversed';
+  amount_paise: number;
+  provider_name: string;
+  external_destination: string | null;
+  description: string;
+  source_account_number: string | null;
+  source_owner_name: string | null;
+  destination_account_number: string | null;
+  destination_owner_name: string | null;
+  initiated_by_name: string | null;
+  initiated_by_role: string | null;
+  created_at: string;
+}
+
 interface SupportTicket {
   id: string;
   customer_name: string;
@@ -60,6 +80,18 @@ interface SupportTicket {
   related_tx_ref: string | null;
   status: 'open' | 'in_review' | 'resolved';
   resolution_note: string | null;
+  created_at: string;
+}
+
+interface EmployeeNotificationRow {
+  id: string;
+  channel: string;
+  recipient_masked: string;
+  message: string;
+  provider: string;
+  provider_message_id: string | null;
+  status: string;
+  error_message: string | null;
   created_at: string;
 }
 
@@ -138,6 +170,14 @@ export function EmployeeWorkspace({ user, onLogout }: { user: AuthUser; onLogout
   const [tickets, setTickets] = useState<SupportTicket[]>([]);
   const [resolutionNotes, setResolutionNotes] = useState<Record<string, string>>({});
 
+  // Bank-wide transaction history
+  const [bankTransactions, setBankTransactions] = useState<BankTxRow[]>([]);
+  const [bankTxTotal, setBankTxTotal] = useState(0);
+  const [txLoading, setTxLoading] = useState(false);
+  const [txSearch, setTxSearch] = useState('');
+  const [txStatusFilter, setTxStatusFilter] = useState<'all' | 'success' | 'pending' | 'failed' | 'reversed'>('all');
+  const [notifications, setNotifications] = useState<EmployeeNotificationRow[]>([]);
+
   const loadCustomers = useCallback(async (q = '') => {
     setLoading(true);
     try {
@@ -166,10 +206,47 @@ export function EmployeeWorkspace({ user, onLogout }: { user: AuthUser; onLogout
     }
   }, [onLogout]);
 
+  const loadBankTransactions = useCallback(
+    async (q = '', status = 'all') => {
+      setTxLoading(true);
+      try {
+        const params = new URLSearchParams();
+        if (q.trim()) params.set('q', q.trim());
+        if (status && status !== 'all') params.set('status', status);
+        const queryStr = params.toString();
+        const res = await apiFetch<{ transactions: BankTxRow[]; totalCount: number }>(
+          `/api/employee/transactions${queryStr ? `?${queryStr}` : ''}`,
+        );
+        setBankTransactions(res.transactions);
+        setBankTxTotal(res.totalCount);
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 401) {
+          await onLogout();
+        }
+      } finally {
+        setTxLoading(false);
+      }
+    },
+    [onLogout],
+  );
+
+  const loadNotifications = useCallback(async () => {
+    try {
+      const res = await apiFetch<{ notifications: EmployeeNotificationRow[] }>('/api/notifications');
+      setNotifications(res.notifications);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        await onLogout();
+      }
+    }
+  }, [onLogout]);
+
   useEffect(() => {
     void loadCustomers();
     void loadTickets();
-  }, [loadCustomers, loadTickets]);
+    void loadBankTransactions();
+    void loadNotifications();
+  }, [loadCustomers, loadTickets, loadBankTransactions, loadNotifications]);
 
   async function selectCustomer(userId: string) {
     setAdjError(null);
@@ -228,6 +305,7 @@ export function EmployeeWorkspace({ user, onLogout }: { user: AuthUser; onLogout
       setAdjReason('');
       await selectCustomer(selectedCustomer.userId);
       await loadCustomers(searchQuery);
+      await loadBankTransactions(txSearch, txStatusFilter);
     } catch (err) {
       setAdjConfirmOpen(false);
       setAdjError(err instanceof ApiError ? err.message : 'Adjustment failed.');
@@ -272,6 +350,7 @@ export function EmployeeWorkspace({ user, onLogout }: { user: AuthUser; onLogout
       setOnbAadhaar('');
       setOnbDepositRupees('');
       await loadCustomers(searchQuery);
+      await loadBankTransactions(txSearch, txStatusFilter);
     } catch (err) {
       setOnbError(err instanceof ApiError ? err.message : 'Customer onboarding failed.');
     } finally {
@@ -298,8 +377,10 @@ export function EmployeeWorkspace({ user, onLogout }: { user: AuthUser; onLogout
         <nav className="flex lg:flex-col overflow-x-auto lg:overflow-visible p-3 gap-1 flex-1">
           {[
             { id: 'customers', label: 'Customer Search', icon: Users },
+            { id: 'transactions', label: 'Bank Transactions', icon: ArrowLeftRight },
             { id: 'onboard', label: 'Onboard Customer', icon: UserPlus },
             { id: 'tickets', label: 'Help Desk Queue', icon: HelpCircle },
+            { id: 'notifications', label: 'Alerts & Inbox', icon: Bell },
           ].map((item) => {
             const Icon = item.icon;
             const active = tab === item.id;
@@ -307,7 +388,14 @@ export function EmployeeWorkspace({ user, onLogout }: { user: AuthUser; onLogout
               <button
                 key={item.id}
                 type="button"
-                onClick={() => setTab(item.id as EmployeeTab)}
+                onClick={() => {
+                  setTab(item.id as EmployeeTab);
+                  if (item.id === 'transactions') {
+                    void loadBankTransactions(txSearch, txStatusFilter);
+                  } else if (item.id === 'notifications') {
+                    void loadNotifications();
+                  }
+                }}
                 className={`flex items-center gap-3 px-3.5 py-2.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap shrink-0 ${
                   active
                     ? 'bg-blue-500/25 text-white'
@@ -341,7 +429,15 @@ export function EmployeeWorkspace({ user, onLogout }: { user: AuthUser; onLogout
             <span>Teller Operations</span>
             <span className="mx-2">/</span>
             <span className="font-semibold text-slate-900">
-              {tab === 'customers' ? 'Customer Search & Adjustments' : tab === 'onboard' ? 'KYC Onboarding' : 'Help Desk'}
+              {tab === 'customers'
+                ? 'Customer Search & Adjustments'
+                : tab === 'transactions'
+                  ? 'All Bank Transactions'
+                  : tab === 'onboard'
+                    ? 'KYC Onboarding'
+                    : tab === 'notifications'
+                      ? 'Manager Notices & Alerts Inbox'
+                      : 'Help Desk'}
             </span>
           </div>
           <div className="flex items-center gap-3 shrink-0">
@@ -717,6 +813,126 @@ export function EmployeeWorkspace({ user, onLogout }: { user: AuthUser; onLogout
             </form>
           )}
 
+          {tab === 'transactions' && (
+            <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-4">
+                <div>
+                  <h2 className="text-lg font-bold text-slate-900">All Bank Transactions</h2>
+                  <p className="text-xs text-slate-500 mt-0.5 tabular-nums">
+                    Showing {bankTransactions.length} of {bankTxTotal} bank-wide ledger transactions
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      void loadBankTransactions(txSearch, txStatusFilter);
+                    }}
+                    className="flex gap-2"
+                  >
+                    <div className="relative">
+                      <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                      <input
+                        type="search"
+                        value={txSearch}
+                        onChange={(e) => setTxSearch(e.target.value)}
+                        placeholder="Ref, account, or name..."
+                        className="pl-8 pr-3 py-1.5 text-xs border border-slate-300 rounded-lg w-52"
+                      />
+                    </div>
+                    <button
+                      type="submit"
+                      className="px-3 py-1.5 text-xs font-medium text-white bg-blue-700 rounded-lg hover:bg-blue-800 whitespace-nowrap shrink-0"
+                    >
+                      Search
+                    </button>
+                  </form>
+
+                  <div className="flex gap-1 p-1 bg-slate-100 rounded-lg">
+                    {(['all', 'success', 'pending', 'failed', 'reversed'] as const).map((st) => (
+                      <button
+                        key={st}
+                        type="button"
+                        onClick={() => {
+                          setTxStatusFilter(st);
+                          void loadBankTransactions(txSearch, st);
+                        }}
+                        className={`px-2.5 py-1 text-xs font-medium rounded capitalize whitespace-nowrap shrink-0 ${
+                          txStatusFilter === st ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'
+                        }`}
+                      >
+                        {st}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              {txLoading ? (
+                <TableSkeleton rows={5} />
+              ) : bankTransactions.length === 0 ? (
+                <EmptyState
+                  title="No transactions found"
+                  description="Transactions posted across customer transfers, QR, bank rails, and teller adjustments will appear here."
+                />
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead>
+                      <tr className="border-b border-slate-200 text-slate-500">
+                        <th className="py-2 pr-3 font-medium">Reference &amp; Time</th>
+                        <th className="py-2 pr-3 font-medium">From / To</th>
+                        <th className="py-2 pr-3 font-medium">Details &amp; Rail</th>
+                        <th className="py-2 pr-3 font-medium">Initiated By</th>
+                        <th className="py-2 pr-3 font-medium">Status</th>
+                        <th className="py-2 text-right font-medium">Amount</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {bankTransactions.map((tx) => {
+                        const fromLabel = tx.source_owner_name
+                          ? `${tx.source_owner_name} (${tx.source_account_number})`
+                          : tx.source_account_number || 'Bank Vault';
+                        const toLabel = tx.destination_owner_name
+                          ? `${tx.destination_owner_name} (${tx.destination_account_number})`
+                          : tx.external_destination || tx.destination_account_number || 'Clearing';
+                        return (
+                          <tr key={tx.id}>
+                            <td className="py-3 pr-3 whitespace-nowrap">
+                              <p className="font-mono font-semibold text-slate-800">{tx.reference_code}</p>
+                              <p className="text-slate-500">{formatDateTime(tx.created_at)}</p>
+                            </td>
+                            <td className="py-3 pr-3">
+                              <p className="text-slate-700">From: {fromLabel}</p>
+                              <p className="text-slate-700">To: {toLabel}</p>
+                            </td>
+                            <td className="py-3 pr-3">
+                              <p className="font-medium text-slate-900">{tx.description}</p>
+                              <p className="font-mono text-slate-500">
+                                {tx.tx_type} · {tx.provider_name}
+                              </p>
+                            </td>
+                            <td className="py-3 pr-3 whitespace-nowrap text-slate-600">
+                              {tx.initiated_by_name || 'System'}
+                              {tx.initiated_by_role ? ` (${tx.initiated_by_role})` : ''}
+                            </td>
+                            <td className="py-3 pr-3 whitespace-nowrap">
+                              <TxStatusText status={tx.status} />
+                            </td>
+                            <td className="py-3 text-right font-mono tabular-nums font-semibold text-slate-900 whitespace-nowrap">
+                              {formatInr(tx.amount_paise)}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+
           {tab === 'tickets' && (
             <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-4">
               <h2 className="text-lg font-bold text-slate-900">Customer Help Desk Queue</h2>
@@ -767,6 +983,58 @@ export function EmployeeWorkspace({ user, onLogout }: { user: AuthUser; onLogout
                           </p>
                         )
                       )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {tab === 'notifications' && (
+            <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h2 className="text-lg font-bold text-slate-900">Manager Notices &amp; Alerts Inbox</h2>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    Operational SMS, Email, and In-App announcements dispatched to your staff account.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void loadNotifications()}
+                  className="px-3 py-1.5 text-xs font-medium text-slate-700 border border-slate-300 rounded-lg hover:bg-slate-50"
+                >
+                  Refresh
+                </button>
+              </div>
+              {notifications.length === 0 ? (
+                <EmptyState
+                  title="No alerts yet"
+                  description="Messages and emails sent by management will appear here."
+                />
+              ) : (
+                <div className="divide-y divide-slate-100">
+                  {notifications.map((n) => (
+                    <div key={n.id} className="py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                      <div>
+                        <p className="text-sm text-slate-900">{n.message}</p>
+                        <p className="text-xs text-slate-500 mt-0.5">
+                          {n.channel.toUpperCase()} · {n.recipient_masked} · {n.provider}
+                          {n.provider_message_id ? ` · ${n.provider_message_id}` : ''} · {formatDateTime(n.created_at)}
+                        </p>
+                        {n.error_message && <p className="text-xs text-red-700 mt-0.5">{n.error_message}</p>}
+                      </div>
+                      <span
+                        className={`text-xs font-mono whitespace-nowrap ${
+                          n.status === 'sent'
+                            ? 'text-emerald-700 font-semibold'
+                            : n.status === 'failed'
+                              ? 'text-red-700'
+                              : 'text-slate-600'
+                        }`}
+                      >
+                        {n.status}
+                      </span>
                     </div>
                   ))}
                 </div>

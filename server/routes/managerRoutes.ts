@@ -1,10 +1,13 @@
 import { Router } from 'express';
 import type Database from 'better-sqlite3';
 import { AppConfig } from '../config.ts';
+import { MAX_EMPLOYEE_ACCOUNTS, MAX_USER_ACCOUNTS, SYSTEM_VAULT_ACCOUNT_ID } from '../db/database.ts';
 import { requireRole } from '../middleware/security.ts';
-import { dispatchTransactionSms } from '../providers/smsProvider.ts';
+import { isEmailLiveConfigured, resolveActiveEmailAdapter, dispatchTransactionEmail, dispatchTransactionNotifications } from '../providers/emailProvider.ts';
+import { dispatchTransactionSms, isSmsLiveConfigured, resolveActiveSmsAdapter } from '../providers/smsProvider.ts';
 import {
   generateId,
+  generateReferenceCode,
   hashPassword,
   maskAccountNumber,
   maskMobile,
@@ -94,11 +97,69 @@ export function createManagerRouter(db: Database.Database, config: AppConfig): R
         {
           name: 'Transaction SMS Notification Gateway',
           mode: config.smsProviderMode,
-          configured: config.smsProviderMode === 'live' ? Boolean(process.env.SMS_PROVIDER_ACCOUNT_SID) : true,
-          requirements: 'Requires DLT template registration (India) and SMS provider SID/token environment variables.',
+          configured: config.smsProviderMode === 'live' ? isSmsLiveConfigured(config) : true,
+          adapter: resolveActiveSmsAdapter(config),
+          requirements: 'Supports Twilio, MSG91, Fast2SMS, or HTTP Webhook via SMS_PROVIDER_MODE=live and provider env credentials.',
+        },
+        {
+          name: 'Gmail & Email Transaction Alert Gateway',
+          mode: config.emailProviderMode,
+          configured: config.emailProviderMode === 'live' ? isEmailLiveConfigured(config) : true,
+          adapter: resolveActiveEmailAdapter(config),
+          requirements: 'Supports 1P Google Workspace Gmail API (Google Sign-In OAuth) plus server-side Gmail SMTP, Resend, SendGrid, or HTTP Webhook.',
         },
       ],
     });
+  });
+
+  router.post('/integrations/test-notification', async (req, res) => {
+    const { channel, recipient, message, confirmed } = (req.body || {}) as {
+      channel?: 'sms' | 'email';
+      recipient?: string;
+      message?: string;
+      confirmed?: boolean;
+    };
+
+    if (!channel || !['sms', 'email'].includes(channel) || !recipient) {
+      res.status(400).json({ error: 'VALIDATION_ERROR', message: 'channel (sms|email) and recipient are required.' });
+      return;
+    }
+
+    const cleanMsg =
+      (message || 'Meridian Trust Bank diagnostic alert: Notification gateway verification check.').trim().slice(0, 300);
+
+    if (channel === 'sms') {
+      const result = await dispatchTransactionSms(db, config, {
+        userId: req.authUser!.id,
+        mobile: recipient.trim(),
+        smsOptIn: true,
+        message: cleanMsg,
+      });
+      res.status(result.status === 'failed' ? 502 : 200).json({ ok: result.status !== 'failed', result });
+      return;
+    }
+
+    const gmailTokenHeader = req.headers['x-gmail-access-token'];
+    const gmailAccessToken =
+      typeof gmailTokenHeader === 'string' ? gmailTokenHeader.replace(/^Bearer\s+/i, '').trim() : undefined;
+
+    if (gmailAccessToken && confirmed !== true) {
+      res.status(400).json({
+        error: 'CONFIRMATION_REQUIRED',
+        message: 'Explicit confirmation is required before sending an email via your connected Gmail account.',
+      });
+      return;
+    }
+
+    const result = await dispatchTransactionEmail(db, config, {
+      userId: req.authUser!.id,
+      email: recipient.trim(),
+      emailOptIn: true,
+      subject: 'Meridian Trust Bank — Live Alert Diagnostic',
+      message: cleanMsg,
+      gmailAccessToken,
+    });
+    res.status(result.status === 'failed' ? 502 : 200).json({ ok: result.status !== 'failed', result });
   });
 
   router.get('/employees', (_req, res) => {
@@ -133,6 +194,10 @@ export function createManagerRouter(db: Database.Database, config: AppConfig): R
         updatedAt: e.updated_at,
       })),
       invites,
+      limits: {
+        maxEmployees: MAX_EMPLOYEE_ACCOUNTS,
+        currentEmployees: employees.length,
+      },
     });
   });
 
@@ -164,6 +229,15 @@ export function createManagerRouter(db: Database.Database, config: AppConfig): R
     const cleanMobile = mobile.trim();
     if (!/^\+?\d{10,15}$/.test(cleanMobile)) {
       res.status(400).json({ error: 'INVALID_MOBILE', message: 'Provide a valid mobile number (e.g. +919800002222).' });
+      return;
+    }
+
+    const empCount = (db.prepare(`SELECT COUNT(*) AS cnt FROM users WHERE role = 'employee'`).get() as { cnt: number }).cnt;
+    if (empCount >= MAX_EMPLOYEE_ACCOUNTS) {
+      res.status(409).json({
+        error: 'EMPLOYEE_LIMIT_REACHED',
+        message: `Maximum capacity of ${MAX_EMPLOYEE_ACCOUNTS} employee IDs reached. Delete an existing employee first.`,
+      });
       return;
     }
 
@@ -406,24 +480,35 @@ export function createManagerRouter(db: Database.Database, config: AppConfig): R
       )
       .all() as Array<Record<string, unknown>>;
 
+    const mapped = rows.map((r) => ({
+      id: r.id,
+      username: r.username,
+      fullName: r.full_name,
+      role: r.role,
+      email: r.email,
+      mobileMasked: maskMobile(r.mobile as string | null),
+      accountMasked: r.account_number ? maskAccountNumber(r.account_number as string) : null,
+      department: r.department,
+      status: r.status,
+      mustChangePassword: r.must_change_password === 1,
+      failedLoginAttempts: r.failed_login_attempts,
+      lockedUntil: r.locked_until,
+      passwordProtection: 'scrypt-salted-hash',
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+    }));
+
+    const currentUsers = mapped.filter((c) => c.role === 'user').length;
+    const currentEmployees = mapped.filter((c) => c.role === 'employee').length;
+
     res.json({
-      credentials: rows.map((r) => ({
-        id: r.id,
-        username: r.username,
-        fullName: r.full_name,
-        role: r.role,
-        email: r.email,
-        mobileMasked: maskMobile(r.mobile as string | null),
-        accountMasked: r.account_number ? maskAccountNumber(r.account_number as string) : null,
-        department: r.department,
-        status: r.status,
-        mustChangePassword: r.must_change_password === 1,
-        failedLoginAttempts: r.failed_login_attempts,
-        lockedUntil: r.locked_until,
-        passwordProtection: 'scrypt-salted-hash',
-        createdAt: r.created_at,
-        updatedAt: r.updated_at,
-      })),
+      credentials: mapped,
+      limits: {
+        maxUsers: MAX_USER_ACCOUNTS,
+        maxEmployees: MAX_EMPLOYEE_ACCOUNTS,
+        currentUsers,
+        currentEmployees,
+      },
     });
   });
 
@@ -489,46 +574,77 @@ export function createManagerRouter(db: Database.Database, config: AppConfig): R
     const userId = generateId('usr');
     let createdAccountNumber: string | null = null;
 
-    db.transaction(() => {
-      db.prepare(`
-        INSERT INTO users (
-          id, username, email, mobile, full_name, password_hash, role, status,
-          must_change_password, sms_opt_in, email_opt_in, kyc_status, department, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 1, 1, 1, 'verified', ?, ?, ?)
-      `).run(
-        userId,
-        cleanUsername,
-        cleanEmail,
-        cleanMobile,
-        fullName.trim(),
-        hashPassword(temporaryPassword),
-        role,
-        role === 'employee' ? (department?.trim() || 'Branch Operations') : null,
-        now,
-        now,
-      );
+    try {
+      db.transaction(() => {
+        const currentRoleCount = (
+          db.prepare('SELECT COUNT(*) AS cnt FROM users WHERE role = ?').get(role) as { cnt: number }
+        ).cnt;
+        const maxAllowed = role === 'employee' ? MAX_EMPLOYEE_ACCOUNTS : MAX_USER_ACCOUNTS;
+        if (currentRoleCount >= maxAllowed) {
+          const err = new Error(
+            role === 'employee'
+              ? `Maximum capacity of ${MAX_EMPLOYEE_ACCOUNTS} employee IDs reached. Delete an existing employee first.`
+              : `Maximum capacity of ${MAX_USER_ACCOUNTS} user IDs reached. Delete an existing user first.`,
+          ) as Error & { code?: string };
+          err.code = role === 'employee' ? 'EMPLOYEE_LIMIT_REACHED' : 'USER_LIMIT_REACHED';
+          throw err;
+        }
 
-      if (role === 'user') {
-        const countRow = db.prepare(`SELECT COUNT(*) as cnt FROM accounts WHERE account_type IN ('checking', 'savings')`).get() as {
-          cnt: number;
-        };
-        createdAccountNumber = `MTB00${100001 + countRow.cnt + Math.floor(Math.random() * 50)}`;
-        const upiHandle = `${cleanUsername.replace(/[^a-z0-9]/g, '')}@meridian`;
         db.prepare(`
-          INSERT INTO accounts (
-            id, account_number, user_id, account_type, currency, upi_handle, status,
-            daily_transfer_limit_paise, per_tx_limit_paise, created_at
-          ) VALUES (?, ?, ?, ?, 'INR', ?, 'active', 10000000, 5000000, ?)
+          INSERT INTO users (
+            id, username, email, mobile, full_name, password_hash, role, status,
+            must_change_password, sms_opt_in, email_opt_in, kyc_status, department, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 1, 1, 1, 'verified', ?, ?, ?)
         `).run(
-          generateId('acct'),
-          createdAccountNumber,
           userId,
-          accountType === 'checking' ? 'checking' : 'savings',
-          upiHandle,
+          cleanUsername,
+          cleanEmail,
+          cleanMobile,
+          fullName.trim(),
+          hashPassword(temporaryPassword),
+          role,
+          role === 'employee' ? (department?.trim() || 'Branch Operations') : null,
+          now,
           now,
         );
+
+        if (role === 'user') {
+          const maxRow = db
+            .prepare(
+              `SELECT COALESCE(MAX(CAST(SUBSTR(account_number, 6) AS INTEGER)), 100000) AS max_seq
+               FROM accounts
+               WHERE account_number LIKE 'MTB00%'`,
+            )
+            .get() as { max_seq: number };
+          let seq = maxRow.max_seq + 1;
+          while (db.prepare('SELECT 1 FROM accounts WHERE account_number = ?').get(`MTB00${seq}`)) {
+            seq += 1;
+          }
+          createdAccountNumber = `MTB00${seq}`;
+          const upiHandle = `${cleanUsername.replace(/[^a-z0-9]/g, '')}@meridian`;
+          db.prepare(`
+            INSERT INTO accounts (
+              id, account_number, user_id, account_type, currency, upi_handle, status,
+              daily_transfer_limit_paise, per_tx_limit_paise, created_at
+            ) VALUES (?, ?, ?, ?, 'INR', ?, 'active', 10000000, 5000000, ?)
+          `).run(
+            generateId('acct'),
+            createdAccountNumber,
+            userId,
+            accountType === 'checking' ? 'checking' : 'savings',
+            upiHandle,
+            now,
+          );
+        }
+      }).immediate();
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if (code === 'USER_LIMIT_REACHED' || code === 'EMPLOYEE_LIMIT_REACHED') {
+        res.status(409).json({ error: code, message: (err as Error).message });
+        return;
       }
-    })();
+      throw err;
+    }
 
     recordAuditLog(db, {
       actorUserId: req.authUser!.id,
@@ -552,7 +668,7 @@ export function createManagerRouter(db: Database.Database, config: AppConfig): R
     });
   });
 
-  router.post('/credentials/:id/reset-password', (req, res) => {
+  router.post('/credentials/:id/reset-password', async (req, res) => {
     const { temporaryPassword, reason } = (req.body || {}) as {
       temporaryPassword?: string;
       reason?: string;
@@ -569,9 +685,17 @@ export function createManagerRouter(db: Database.Database, config: AppConfig): R
     }
 
     const target = db
-      .prepare(`SELECT id, username, role, mobile, sms_opt_in FROM users WHERE id = ? AND role IN ('user', 'employee')`)
+      .prepare(`SELECT id, username, role, mobile, email, sms_opt_in, email_opt_in FROM users WHERE id = ? AND role IN ('user', 'employee')`)
       .get(req.params.id) as
-      | { id: string; username: string; role: string; mobile: string | null; sms_opt_in: number }
+      | {
+          id: string;
+          username: string;
+          role: string;
+          mobile: string | null;
+          email: string | null;
+          sms_opt_in: number;
+          email_opt_in: number;
+        }
       | undefined;
 
     if (!target) {
@@ -589,10 +713,13 @@ export function createManagerRouter(db: Database.Database, config: AppConfig): R
       db.prepare('UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL').run(now, target.id);
     })();
 
-    dispatchTransactionSms(db, config, {
+    await dispatchTransactionNotifications(db, config, {
       userId: target.id,
       mobile: target.mobile,
+      email: target.email,
       smsOptIn: true,
+      emailOptIn: true,
+      subject: `Meridian Trust Bank — Temporary Password Reset (${target.username})`,
       message: `Meridian Trust Bank: A temporary password reset was issued for ${target.username}. You must set a new password at next login.`,
     });
 
@@ -640,13 +767,404 @@ export function createManagerRouter(db: Database.Database, config: AppConfig): R
     res.json({ ok: true, message: `Account ${target.username} unlocked.` });
   });
 
+  router.delete('/credentials/:id', (req, res) => {
+    const { reason } = (req.body || {}) as { reason?: string };
+    const cleanReason = reason?.trim() || 'Manager account deletion';
+    if (cleanReason.length < 4) {
+      res.status(400).json({ error: 'REASON_REQUIRED', message: 'Audit reason must be at least 4 characters.' });
+      return;
+    }
+
+    const target = db
+      .prepare(`SELECT id, username, full_name, role FROM users WHERE id = ? AND role IN ('user', 'employee')`)
+      .get(req.params.id) as
+      | { id: string; username: string; full_name: string; role: 'user' | 'employee' }
+      | undefined;
+
+    if (!target) {
+      res.status(404).json({ error: 'NOT_FOUND', message: 'User or employee account not found.' });
+      return;
+    }
+
+    const managerId = req.authUser!.id;
+    const now = new Date().toISOString();
+    let totalSettledPaise = 0;
+
+    db.transaction(() => {
+      const userAccounts = db
+        .prepare('SELECT id, account_number FROM accounts WHERE user_id = ?')
+        .all(target.id) as Array<{ id: string; account_number: string }>;
+
+      for (const acct of userAccounts) {
+        const balancePaise = getAccountBalancePaise(db, acct.id);
+        if (balancePaise > 0) {
+          totalSettledPaise += balancePaise;
+          const txId = generateId('tx');
+          db.prepare(`
+            INSERT INTO ledger_transactions (
+              id, reference_code, idempotency_key, tx_type, status, amount_paise, currency,
+              source_account_id, destination_account_id, external_destination, provider_name,
+              provider_tx_ref, description, initiated_by_user_id, created_at, completed_at
+            ) VALUES (?, ?, ?, 'employee_debit', 'success', ?, 'INR', ?, ?, NULL, 'internal', ?, ?, ?, ?, ?)
+          `).run(
+            txId,
+            generateReferenceCode('CLS'),
+            `acct_close_${acct.id}_${txId}`,
+            balancePaise,
+            acct.id,
+            SYSTEM_VAULT_ACCOUNT_ID,
+            `CLS-${acct.account_number}`,
+            `Account closure settlement for deleted user ${target.username}: ${cleanReason}`,
+            managerId,
+            now,
+            now,
+          );
+
+          const insertEntry = db.prepare(`
+            INSERT INTO ledger_entries (id, transaction_id, account_id, entry_type, amount_paise, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+          `);
+          insertEntry.run(generateId('le'), txId, acct.id, 'debit', balancePaise, now);
+          insertEntry.run(generateId('le'), txId, SYSTEM_VAULT_ACCOUNT_ID, 'credit', balancePaise, now);
+        }
+
+        db.prepare(`UPDATE qr_payment_tokens SET status = 'expired' WHERE merchant_account_id = ? AND status = 'active'`).run(
+          acct.id,
+        );
+      }
+
+      db.prepare(`UPDATE accounts SET user_id = NULL, status = 'closed', upi_handle = NULL WHERE user_id = ?`).run(
+        target.id,
+      );
+
+      db.prepare('DELETE FROM sessions WHERE user_id = ?').run(target.id);
+      db.prepare('DELETE FROM password_recovery_tokens WHERE user_id = ?').run(target.id);
+      db.prepare('DELETE FROM notifications WHERE user_id = ?').run(target.id);
+      db.prepare('DELETE FROM help_tickets WHERE user_id = ?').run(target.id);
+      db.prepare('UPDATE help_tickets SET assigned_employee_id = NULL WHERE assigned_employee_id = ?').run(target.id);
+      db.prepare('UPDATE employee_invites SET accepted_user_id = NULL WHERE accepted_user_id = ?').run(target.id);
+      db.prepare('UPDATE audit_logs SET actor_user_id = NULL WHERE actor_user_id = ?').run(target.id);
+      db.prepare('UPDATE ledger_transactions SET initiated_by_user_id = ? WHERE initiated_by_user_id = ?').run(
+        managerId,
+        target.id,
+      );
+
+      db.prepare('DELETE FROM users WHERE id = ?').run(target.id);
+    }).immediate();
+
+    recordAuditLog(db, {
+      actorUserId: managerId,
+      actorRole: 'manager',
+      action: target.role === 'employee' ? 'EMPLOYEE_DELETED' : 'USER_DELETED',
+      targetType: 'user',
+      targetId: target.id,
+      details: {
+        deletedUsername: target.username,
+        deletedFullName: target.full_name,
+        deletedRole: target.role,
+        settledBalancePaise: totalSettledPaise,
+        reason: cleanReason,
+      },
+      ipAddress: req.ip || null,
+    });
+
+    res.json({
+      ok: true,
+      deleted: {
+        id: target.id,
+        username: target.username,
+        role: target.role,
+        settledBalancePaise: totalSettledPaise,
+      },
+      message: `${target.role === 'employee' ? 'Employee' : 'User'} ${target.username} deleted.`,
+    });
+  });
+
+  router.get('/messages', (_req, res) => {
+    const rows = db
+      .prepare(
+        `SELECT n.id, n.user_id, u.username, u.full_name, u.role, n.channel, n.recipient_masked,
+                n.message, n.provider, n.provider_message_id, n.status, n.error_message, n.created_at
+         FROM notifications n
+         JOIN users u ON u.id = n.user_id
+         WHERE n.transaction_id IS NULL AND u.role IN ('user', 'employee')
+         ORDER BY n.created_at DESC
+         LIMIT 120`,
+      )
+      .all();
+
+    res.json({ messages: rows });
+  });
+
+  router.post('/messages/send', async (req, res) => {
+    const {
+      audience = 'selected',
+      recipientUserIds = [],
+      channels = [],
+      subject,
+      message,
+      confirmed,
+    } = (req.body || {}) as {
+      audience?: 'selected' | 'all_users' | 'all_employees' | 'all';
+      recipientUserIds?: string[];
+      channels?: Array<'sms' | 'email' | 'in_app'>;
+      subject?: string;
+      message?: string;
+      confirmed?: boolean;
+    };
+
+    const validChannels = Array.isArray(channels)
+      ? Array.from(new Set(channels.filter((c): c is 'sms' | 'email' | 'in_app' => ['sms', 'email', 'in_app'].includes(c))))
+      : [];
+
+    if (validChannels.length === 0) {
+      res.status(400).json({
+        error: 'VALIDATION_ERROR',
+        message: 'Select at least one delivery channel (sms, email, or in_app).',
+      });
+      return;
+    }
+
+    const cleanMessage = (message || '').trim();
+    if (cleanMessage.length < 3 || cleanMessage.length > 1000) {
+      res.status(400).json({
+        error: 'VALIDATION_ERROR',
+        message: 'Message must be between 3 and 1000 characters.',
+      });
+      return;
+    }
+
+    const cleanSubject = (subject || 'Notice from Meridian Trust Bank Management').trim().slice(0, 140);
+
+    const gmailTokenHeader = req.headers['x-gmail-access-token'];
+    const gmailAccessToken =
+      typeof gmailTokenHeader === 'string' ? gmailTokenHeader.replace(/^Bearer\s+/i, '').trim() : undefined;
+
+    if (gmailAccessToken && validChannels.includes('email') && confirmed !== true) {
+      res.status(400).json({
+        error: 'CONFIRMATION_REQUIRED',
+        message: 'Explicit confirmation is required before sending emails via your connected Gmail account.',
+      });
+      return;
+    }
+
+    if (!['selected', 'all_users', 'all_employees', 'all'].includes(audience)) {
+      res.status(400).json({
+        error: 'VALIDATION_ERROR',
+        message: 'audience must be selected, all_users, all_employees, or all.',
+      });
+      return;
+    }
+
+    type RecipientRow = {
+      id: string;
+      username: string;
+      full_name: string;
+      role: 'user' | 'employee';
+      email: string | null;
+      mobile: string | null;
+    };
+
+    let recipients: RecipientRow[] = [];
+    if (audience === 'all') {
+      recipients = db
+        .prepare(
+          `SELECT id, username, full_name, role, email, mobile
+           FROM users
+           WHERE role IN ('user', 'employee') AND status = 'active'
+           ORDER BY role ASC, full_name ASC`,
+        )
+        .all() as RecipientRow[];
+    } else if (audience === 'all_users') {
+      recipients = db
+        .prepare(
+          `SELECT id, username, full_name, role, email, mobile
+           FROM users
+           WHERE role = 'user' AND status = 'active'
+           ORDER BY full_name ASC`,
+        )
+        .all() as RecipientRow[];
+    } else if (audience === 'all_employees') {
+      recipients = db
+        .prepare(
+          `SELECT id, username, full_name, role, email, mobile
+           FROM users
+           WHERE role = 'employee' AND status = 'active'
+           ORDER BY full_name ASC`,
+        )
+        .all() as RecipientRow[];
+    } else {
+      const cleanIds = Array.isArray(recipientUserIds)
+        ? Array.from(new Set(recipientUserIds.map((id) => String(id).trim()).filter(Boolean)))
+        : [];
+      if (cleanIds.length === 0) {
+        res.status(400).json({
+          error: 'NO_RECIPIENTS',
+          message: 'Select at least one active user or employee.',
+        });
+        return;
+      }
+      const placeholders = cleanIds.map(() => '?').join(', ');
+      recipients = db
+        .prepare(
+          `SELECT id, username, full_name, role, email, mobile
+           FROM users
+           WHERE id IN (${placeholders}) AND role IN ('user', 'employee') AND status = 'active'
+           ORDER BY full_name ASC`,
+        )
+        .all(...cleanIds) as RecipientRow[];
+    }
+
+    if (recipients.length === 0) {
+      res.status(404).json({
+        error: 'NO_ACTIVE_RECIPIENTS',
+        message: 'No active user or employee recipients matched your selection.',
+      });
+      return;
+    }
+
+    let smsSent = 0;
+    let emailSent = 0;
+    let inAppSent = 0;
+    let failedCount = 0;
+
+    const results: Array<{
+      userId: string;
+      username: string;
+      fullName: string;
+      role: 'user' | 'employee';
+      deliveries: Array<{
+        channel: 'sms' | 'email' | 'in_app';
+        status: string;
+        provider: string;
+        providerMessageId?: string | null;
+        errorMessage?: string;
+      }>;
+    }> = [];
+
+    const insertInAppStmt = db.prepare(`
+      INSERT INTO notifications (
+        id, user_id, transaction_id, channel, recipient_masked, message,
+        provider, provider_message_id, status, error_message, created_at
+      ) VALUES (?, ?, NULL, 'in_app', ?, ?, 'manager_portal', ?, 'sent', NULL, ?)
+    `);
+
+    for (const r of recipients) {
+      const deliveries: Array<{
+        channel: 'sms' | 'email' | 'in_app';
+        status: string;
+        provider: string;
+        providerMessageId?: string | null;
+        errorMessage?: string;
+      }> = [];
+
+      if (validChannels.includes('sms')) {
+        const smsRes = await dispatchTransactionSms(db, config, {
+          userId: r.id,
+          mobile: r.mobile,
+          smsOptIn: true,
+          message: `${cleanSubject}: ${cleanMessage}`.slice(0, 480),
+        });
+        if (smsRes.status === 'failed') {
+          failedCount += 1;
+        } else {
+          smsSent += 1;
+        }
+        deliveries.push({
+          channel: 'sms',
+          status: smsRes.status,
+          provider: smsRes.provider,
+          providerMessageId: smsRes.providerMessageId,
+          errorMessage: smsRes.errorMessage,
+        });
+      }
+
+      if (validChannels.includes('email')) {
+        const emailRes = await dispatchTransactionEmail(db, config, {
+          userId: r.id,
+          email: r.email,
+          emailOptIn: true,
+          subject: cleanSubject,
+          message: cleanMessage,
+          gmailAccessToken,
+        });
+        if (emailRes.status === 'failed') {
+          failedCount += 1;
+        } else {
+          emailSent += 1;
+        }
+        deliveries.push({
+          channel: 'email',
+          status: emailRes.status,
+          provider: emailRes.provider,
+          providerMessageId: emailRes.providerMessageId,
+          errorMessage: emailRes.errorMessage,
+        });
+      }
+
+      if (validChannels.includes('in_app')) {
+        const notifId = generateId('ntf');
+        const msgRef = generateReferenceCode('MSG');
+        const formattedInApp = `[${cleanSubject}] ${cleanMessage}`;
+        insertInAppStmt.run(notifId, r.id, r.username, formattedInApp, msgRef, new Date().toISOString());
+        inAppSent += 1;
+        deliveries.push({
+          channel: 'in_app',
+          status: 'sent',
+          provider: 'manager_portal',
+          providerMessageId: msgRef,
+        });
+      }
+
+      results.push({
+        userId: r.id,
+        username: r.username,
+        fullName: r.full_name,
+        role: r.role,
+        deliveries,
+      });
+    }
+
+    recordAuditLog(db, {
+      actorUserId: req.authUser!.id,
+      actorRole: 'manager',
+      action: 'MANAGER_MESSAGE_SENT',
+      targetType: 'notification_broadcast',
+      targetId: audience,
+      details: {
+        audience,
+        channels: validChannels,
+        subject: cleanSubject,
+        recipientCount: recipients.length,
+        recipientUsernames: recipients.map((r) => r.username).slice(0, 25),
+        smsSent,
+        emailSent,
+        inAppSent,
+        failedCount,
+      },
+      ipAddress: req.ip || null,
+    });
+
+    res.json({
+      ok: true,
+      summary: {
+        totalRecipients: recipients.length,
+        smsSent,
+        emailSent,
+        inAppSent,
+        failedCount,
+      },
+      results,
+    });
+  });
+
   return router;
 }
 
 export function createWebhookRouter(db: Database.Database, config: AppConfig): Router {
   const router = Router();
 
-  router.post('/payment-provider', (req, res) => {
+  router.post('/payment-provider', async (req, res) => {
     const sig = req.headers['x-webhook-signature'];
     const rawBody = JSON.stringify(req.body || {});
     if (!sig || typeof sig !== 'string' || !verifyHmac(rawBody, sig, config.paymentWebhookSecret)) {
@@ -676,15 +1194,20 @@ export function createWebhookRouter(db: Database.Database, config: AppConfig): R
 
       const settled = settlePendingTransaction(db, transactionId, outcome, txRow.initiated_by_user_id, reason);
       const user = db
-        .prepare('SELECT id, mobile, sms_opt_in FROM users WHERE id = ?')
-        .get(txRow.initiated_by_user_id) as { id: string; mobile: string | null; sms_opt_in: number } | undefined;
+        .prepare('SELECT id, mobile, email, sms_opt_in, email_opt_in FROM users WHERE id = ?')
+        .get(txRow.initiated_by_user_id) as
+        | { id: string; mobile: string | null; email: string | null; sms_opt_in: number; email_opt_in: number }
+        | undefined;
 
       if (user) {
-        dispatchTransactionSms(db, config, {
+        await dispatchTransactionNotifications(db, config, {
           userId: user.id,
           mobile: user.mobile,
+          email: user.email,
           smsOptIn: user.sms_opt_in === 1,
+          emailOptIn: user.email_opt_in === 1,
           transactionId: settled.original.id,
+          subject: `Payment ${settled.original.reference_code} Settlement: ${settled.original.status.toUpperCase()}`,
           message: `Payment ${settled.original.reference_code} settled with status: ${settled.original.status.toUpperCase()}.`,
         });
       }
