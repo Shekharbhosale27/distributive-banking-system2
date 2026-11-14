@@ -1,0 +1,10 @@
+{
+  "name": "Meridian Trust Bank",
+  "description": "Role-based digital banking platform with double-entry ledger, QR payments, KYC onboarding, and audit governance.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
